@@ -40,7 +40,11 @@ Previously, L2 cache was commonly used in NVGPU/AMD GPU to trackle the problem, 
 ## Reference
 
 [1] DeepSeek-AI V3.2 (2024). DeepSeek-V32 Technical Report; Accessed on April 26, 2026
+
 [2] DeepSeek-AI V4 (2026). DeepSeek-V4 Technical Report;  Accessed on April 26, 2026
+
 [3] Dissecting DeepSeek V4 ：https://www.zhihu.com/question/2030963929510310856/answer/2031157557008541232?share_code=1nP5rOshEmo63&utm_psn=2031815957111419327; Accessed on April 26, 2026
+
 [4] SGLang 2026.4 (0.5.10.post2.dev419+g635e922eb), classical throughput optimized design of TopK : https://github.com/sgl-project/sglang/blob/c7878dbb6ddfc9c6721b9db20a876f2718b0e955/sgl-kernel/csrc/elementwise/topk.cu#L448; Accessed on April 26 2026
+
 [5] MoE Align and Sort : https://huggingface.co/blog/yiakwy-xpu-team/efficient-moe-align-sort-design-for-sglang
