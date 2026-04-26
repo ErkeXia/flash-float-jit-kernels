@@ -1,0 +1,7 @@
+-r common.txt
+
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4/torch-2.6.0%2Brocm6.4.0.git2fb0ac2b-cp312-cp312-linux_x86_64.whl
+
+torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4/torchvision-0.18.0%2Brocm6.4.0.gitc7ec8356-cp312-cp312-linux_x86_64.whl
+
+# torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4/torchaudio-2.6.0%2Brocm6.4.0.gitd8831425-cp312-cp312-linux_x86_64.whl
