@@ -35,9 +35,9 @@ We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding
 
 - Second, we enhance the linear mapping properties for radix sort in **NSA** problem for reduction of radix sorting iterations; insteadd of traditional top **8/11/13** bits of IEEE FP32, FP16 format, we redesign the linear mapping such that $bin(x) >= bin(y)$, naturally deducing $x >= y$. 
 
-With this linear mapping design, we greatly reduced per block elements dropped in the threshold bin in redix sorting scheme and greatly reduce the residual numbers in later rounds.
+  With this linear mapping design, we greatly reduced per block elements dropped in the threshold bin in redix sorting scheme and greatly reduce the residual numbers in later rounds.
   
-This further facilitate cache friendly re-visiting over 1-M context length : we hence enable less **SMEM** in revisiting more elements.
+  This further facilitate cache friendly re-visiting over 1-M context length : we hence enable less **SMEM** in revisiting more elements.
 <br/>
 
 - Finally, when remainder elements reduced to **8**/**16**, we can simply use **CAS** operations to performa a **neat parallel sorting** in few cycles. This further reduce the latency overhead in the last round.
