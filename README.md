@@ -31,7 +31,7 @@ Leveraging the latest SGLang (2026.3) as the benchmark, we investigated the root
   <img alt="dist-radix-radix-topk-indexer" src="https://raw.githubusercontent.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/main/assets/img/distributed-radix-topk-indexer.png">
 </picture>
 
-**GB300**
+**B300/GB300**
 
 | Sequence Length (L) | torch.topk (ms) | sgl fast_topk_v2 (ms) | flash fast_topk_v3 (ms) | vs. sgl (Speedup) | vs. torch (Speedup) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
