@@ -43,6 +43,8 @@ Leveraging the latest SGLang (2026.3) as the benchmark, we investigated the root
 | 524,288 | 0.1536 | 0.1726 | 0.0620 | 2.79x | 2.48x |
 | 1,048,576 | 0.2602 | 0.3753 | 0.1107 | 3.39x | 2.35x |
 
+<br />
+
 We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding latency in workload of low batch size, yet with upto 1-M context length. 
 
 - First we compute historgram in parallel to reduce collision rates per block and then accumulate the histogram via NoC network before N-ways prefix sum and prove this is an effective method to reduce latency for a throughput oriented hardware design. 
@@ -71,7 +73,7 @@ Our CUDA implementation stems directly from the SGLang-optimized variant (fast_t
 
 However, both the tileLang DSL and its generated CUDA kernels lack optimizations for cross-block communication via the Network-on-Chip (NoC). By relying on global memory for inter-block synchronization rather than hardware-accelerated features like DSMEM (Distributed Shared Memory), they exhibit significantly higher latency in our benchmarks compared to our CUDA implementation.
 
-On the other hand, tileLang excels in its pipelining mechanism, which enables efficient I/O-compute overlap. This is particularly advantageous in scenarios where the computational load is heavy enough to hide the memory latency of TopK operations. We will further explore these trade-offs and our integration strategies in the discussion of our ThunderMuon optimizer.
+On the other hand, tileLang excels in its pipelining mechanism, which enables efficient I/O-compute overlap. This is particularly advantageous in scenarios where the computational load is heavy enough to hide the memory latency of TopK operations. We will further explore these trade-offs and our integration strategies in the discussion of our **ThunderMuon** optimizer.
 
 ###### Triton Gluon
 
@@ -97,7 +99,7 @@ On the other hand, tileLang excels in its pipelining mechanism, which enables ef
 
 ## Citation
 
-If you use this codebase, or otherwise find our work valuable, please cite Gram Newton-Schulz:
+If you use this codebase, or otherwise find our work valuable, please cite DistRadixTopK2026:
 
 ```bibtex
 @misc{DistRadixTopK2026,
