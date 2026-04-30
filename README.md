@@ -16,7 +16,7 @@ This repository is complemntary of "FlashFloat" with JIT Kernels
 
 <h2 id="highlight"> Highlight </h2>
 
-- [🔥 ultra low latency topk , reduced maximum 50% 🚀 batch=1 latency for 1-M context 🎯!](#Ultra-Low-Latency-TopK-Indexer)
+- April 27 2026, [🔥 ultra low latency topk , reduced maximum 50% 🚀 batch=1 latency for 1-M context 🎯!](#Ultra-Low-Latency-TopK-Indexer)
 
 
 <h2 id="Ultra-Low-Latency-TopK-Indexer">🔥 Ultra Low Latency TopK Indexer</h2>
@@ -45,14 +45,51 @@ We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding
 
 Previously, L2 cache was commonly used in NVGPU/AMD GPU to trackle the problem, for example in MoE Align Block Multi Block Execution Algorithm published 2025 [5], we tackle this problem by introducing mathematically equivalent **unaligned parallel prefix sum**. With distributed radix sort, we further prove that on-chip network can further reduce latency of our kernel, facilitating new design of algorithm and software for 1-M context.
 
+#### Compared to other works at the the time article is composing
+
+###### TLE DSL Topk (April 17, 2026)
+Triton-TLE (Triton Language Extension) [TopK](https://github.com/flagos-ai/FlagTree/blob/f9a8d23602a65ec5c1af3b117e1faa46fe6f63b7/python/tutorials/tle/deepseek_v32/01-topk_selector.py#L3055) sits on the Pareto frontier of the prductivity and performance, filling the gap between our CUDA and other high-level DSL such as triton-Gluon and TileLang. It is highly efficient and elegant to utilize the DSHMEM to reduce the cross blocks communications lantency.
+
+The triton extension introduce the semantics explicitly visiting remote (tle.remote) blocks within the clusters via block-level device mesh (**tle.device_mesh**), cluster barriers (**tle.distributed_barrier**) and close loop on chip processing. While our native CUDA implementation offers peak performance, this DSL drastically simplifies the implementation complexity compared to manual CUDA coding.
+
+###### TileLang
+Our CUDA implementation stems directly from the SGLang-optimized variant (fast_topk_v2) of the tileLang implementation. Built natively on the TVM FFI, tileLang significantly reduces CPU overhead and facilitates the rapid adoption of tiling-based programming advantages.
+
+However, both the tileLang DSL and its generated CUDA kernels lack optimizations for cross-block communication via the Network-on-Chip (NoC). By relying on global memory for inter-block synchronization rather than hardware-accelerated features like DSMEM (Distributed Shared Memory), they exhibit significantly higher latency in our benchmarks compared to our CUDA implementation.
+
+On the other hand, tileLang excels in its pipelining mechanism, which enables efficient I/O-compute overlap. This is particularly advantageous in scenarios where the computational load is heavy enough to hide the memory latency of TopK operations. We will further explore these trade-offs and our integration strategies in the discussion of our ThunderMuon optimizer.
+
+###### Triton Gluon
+
+
+###### Flashinfer TopK
+
+
+###### TRT-LLM (April 27, 2026)
+
+
 ## Reference
 
-[1] DeepSeek-AI V3.2 (2024). DeepSeek-V32 Technical Report; Accessed on April 26, 2026
+[1] DeepSeek-AI V3.2 (2025.12). DeepSeek-V32 Technical Report: "Pushing the Frontier of Open Large Language Models", arXiv:2512.02556; Accessed on April 26, 2026
 
-[2] DeepSeek-AI V4 (2026). DeepSeek-V4 Technical Report;  Accessed on April 26, 2026
+[2] DeepSeek-AI V4 (2026). DeepSeek-V4 Technical Report: "Towards Highly Efficient Millon Token Context Intelligence", https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf;  Accessed on April 26, 2026
 
 [3] Dissecting DeepSeek V4 ：https://www.zhihu.com/question/2030963929510310856/answer/2031157557008541232?share_code=1nP5rOshEmo63&utm_psn=2031815957111419327; Accessed on April 26, 2026
 
 [4] SGLang 2026.4 (0.5.10.post2.dev419+g635e922eb), classical throughput optimized design of TopK : https://github.com/sgl-project/sglang/blob/c7878dbb6ddfc9c6721b9db20a876f2718b0e955/sgl-kernel/csrc/elementwise/topk.cu#L448; Accessed on April 26 2026
 
-[5] MoE Align and Sort : https://huggingface.co/blog/yiakwy-xpu-team/efficient-moe-align-sort-design-for-sglang
+[5] MoE Align and Sort (2025.3), https://huggingface.co/blog/yiakwy-xpu-team/efficient-moe-align-sort-design-for-sglang, LEI (yiak.wy@gmail.com); Accessed on April 26 2026
+
+
+## Citation
+
+If you use this codebase, or otherwise find our work valuable, please cite Gram Newton-Schulz:
+
+```bibtex
+@misc{DistRadixTopK2026,
+  title   = {Ultra Low Latency Distributed Radix TopK Indexer Via NoC},
+  author  = {LEI WANG, Hui Guo, Hao Gu, Bei Liu, Sirui Han, Wei Xue, Yike Guo},
+  year    = {2026},
+  url     = {https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels}
+}
+```

@@ -34,7 +34,7 @@ def _jit_fast_topk_v3_module():
     else:
         return load_jit(
             "fast_topk_v3",
-            cuda_files=["nsa/topk_indexer_radix.cu"],
+            cuda_files=["topk_indexer/topk_indexer_radix.cu"],
             cuda_wrappers=[(_PY_SYMBOL, _CPP_ENTRY)],
         )
 

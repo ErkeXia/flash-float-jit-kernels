@@ -2,7 +2,6 @@ import itertools
 import os
 from typing import Any, Optional
 
-import sgl_kernel
 import torch
 import triton
 import triton.testing
