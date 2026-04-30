@@ -25,9 +25,23 @@ The introduction of the NSA (Native Sparse Attention) mechanism in DeepSeek V3.2
 
 Leveraging the latest SGLang (2026.3) as the benchmark, we investigated the root causes of this latency bottleneck: kernels for conventional throughput-optimized GPU designs suffer from low device utilization in low-batch, yet long context decoding scenarios due to insufficient inter-block coordination [4]. For example, on-chip network have been maturely adopted for many years in processor hareware such as IPU, Cerebras and Groq, but only being introduced into Hopper since 2022. By exploiting the limited on-chip communication capabilities of the Hopper architecture  (upto 8 blocks per cluster) through hardware-aware alorithm-hardware co-design, we achieve a **50%** latency reduction in low-batch yet long context decoding scenarios, demonstrating the effectiveness of synergistic optimization and **NoC** for long-context inference:
 
+**H100/H800**
+
 <picture>
   <img alt="dist-radix-radix-topk-indexer" src="https://raw.githubusercontent.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/main/assets/img/distributed-radix-topk-indexer.png">
 </picture>
+
+**GB300**
+
+| Sequence Length (L) | torch.topk (ms) | sgl fast_topk_v2 (ms) | flash fast_topk_v3 (ms) | vs. sgl (Speedup) | vs. torch (Speedup) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 16,384 | 0.0880 | 0.0144 | 0.0144 | 1.00x | 6.11x |
+| 65,536 | 0.0879 | 0.0374 | 0.0182 | 2.05x | 4.81x |
+| 98,304 | 0.0878 | 0.0457 | 0.0205 | 2.23x | 4.28x |
+| 120,000 | 0.0976 | 0.0492 | 0.0236 | 2.09x | 4.14x |
+| 262,144 | 0.1148 | 0.1106 | 0.0369 | 2.99x | 3.11x |
+| 524,288 | 0.1536 | 0.1726 | 0.0620 | 2.79x | 2.48x |
+| 1,048,576 | 0.2602 | 0.3753 | 0.1107 | 3.39x | 2.35x |
 
 We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding latency in workload of low batch size, yet with upto 1-M context length. 
 
@@ -88,7 +102,7 @@ If you use this codebase, or otherwise find our work valuable, please cite Gram 
 ```bibtex
 @misc{DistRadixTopK2026,
   title   = {Ultra Low Latency Distributed Radix TopK Indexer Via NoC},
-  author  = {LEI WANG, Hui Guo, Hao Gu, Bei Liu, Sirui Han, Wei Xue, Yike Guo},
+  author  = {LEI WANG, Hao Gu, Hui Guo, Bei Liu, Dongjie Zou, Mingzhe Zheng, Sirui Han, Wei Xue, Qifeng Chen, Yike Guo},
   year    = {2026},
   url     = {https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels}
 }
