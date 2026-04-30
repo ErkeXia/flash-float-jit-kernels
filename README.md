@@ -49,7 +49,7 @@ We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding
 
 - First we compute historgram in parallel to reduce collision rates per block and then accumulate the histogram via NoC network before N-ways prefix sum and prove this is an effective method to reduce latency for a throughput oriented hardware design. 
 
-- Second, we enhance the linear mapping properties for radix sort in **NSA** problem for reduction of radix sorting iterations; insteadd of traditional top **8/11/13** bits of IEEE FP32, FP16 format, we redesign the linear mapping such that $bin(x) >= bin(y)$, naturally deducing $x >= y$. 
+- Second, we enhance the linear mapping properties for radix sort in **NSA** problem for reduction of radix sorting iterations; insteadd of traditional top **8/11/13** bits [9] of IEEE FP32, FP16 format, we redesign the linear mapping such that $bin(x) >= bin(y)$, naturally deducing $x >= y$. 
 
   With this linear mapping design, we greatly reduced per block elements dropped in the threshold bin in redix sorting scheme and greatly reduce the residual numbers in later rounds.
   
@@ -90,12 +90,14 @@ On the other hand, tileLang excels in its pipelining mechanism, which enables ef
 ###### TRT-LLM (April 27, 2026)
 
 **Summary**
-Distinct from distribution-agnostic algorithm with Monolithtic Mapping, The Guess-Verify-Refine (GVR) algorithm optimizes Top-K selection heuristicly for DeepSeek-V3.2 on NVIDIA Blackwell GPUs by reducing the nubmer dropping the target threshold each round. 
+Distinct from distribution-agnostic algorithm with Monolithtic Mapping, The Guess-Verify-Refine (GVR) algorithm [8] optimizes Top-K selection heuristicly for DeepSeek-V3.2 on NVIDIA Blackwell GPUs by reducing the nubmer dropping into the target threshold bin each round. 
 
 Pivoting from a blind search to a data-aware prediction, the techinique is built upon mathematic properties of Toeplitz matrix structure induced by RoPE in DS32 such that the prediction of radix step "t+1" highly relying on radix step "t".
 
 **Single Pass Optimization**
-Both SGLang and our implementation deliberately eschew primitives such as `__popc` and `__ballot_sync`. This architectural choice stems from the fact that warp-level voting can incur significant latencies, sometimes exceeding 30,000 cycles in high-contention scenarios [8].
+The kernel of the paper digests up to 60KB shared memory (4x share memory we actually used) and verified on SWE-bench-derived LongSeqTasks dataset to pre-compute candidates. That is if the data disbribution failed to pass **canUseHeuristic**, GVR TopK will not be called.
+
+Both SGLang and our implementation deliberately avoid primitives such as `__popc` and `__ballot_sync`. This architectural choice stems from the fact that warp-level voting can incur significant latencies, sometimes exceeding 30,000 cycles in high-contention scenarios [8].
 
 Traditional ballot-based voting relies on expensive bit-shifting operations (a mechanism we analyze in depth in our upcoming "Ultra-Low Bit Precision" paper). Despite these overheads, this pattern remains prevalent in the legacy TRT-LLM codebase:
 ```c++
@@ -106,13 +108,18 @@ Traditional ballot-based voting relies on expensive bit-shifting operations (a m
     __syncwarp();
 ```
 
-To address these bottlenecks, NVIDIA integrated a [ballot-free kernel](https://github.com/NVIDIA/TensorRT-LLM/blob/eaed16fb4bb5e39a45a6bf1a78ba2a26adde7945/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk_cluster.py#L344) (March 2026) into TRT-LLM in March 2026. This implementation, written in CuteDSL, leverages a Multi-CTA architecture with L2-cache-assisted synchronization to eliminate warp-level voting dependencies.
+**Compared to TRT-LLM production codebase**
+The whole algorithm is  based on the earlier [two stages solution: topKPerRowDecode](https://github.com/NVIDIA/TensorRT-LLM/blame/v1.3.0rc10/cpp/tensorrt_llm/kernels/indexerTopK.cu), see [the details](https://github.com/NVIDIA/TensorRT-LLM/blame/628bb566050d693894ddf22de03581dd101747c3/cpp/tensorrt_llm/kernels/indexerTopK.cu#L743) in TRT-LLM **v1.3.0rc10**, this largely limited its peak perfmance in 1-M context scenarios.
 
+Recognizing this, the new approach [ballot-free kernel](https://github.com/NVIDIA/TensorRT-LLM/pull/12236) was integrated into TRT-LLM on March 16 2026. This implementation, written in cutedsl, leverages a Multi-CTA architecture with L2-cache-assisted synchronization to eliminate warp-level voting dependencies.
 
-**Potential latency bottlenects in multi-rounds execution**
-Recognizing this, this new approach [ballot-free kernel](https://github.com/NVIDIA/TensorRT-LLM/blob/eaed16fb4bb5e39a45a6bf1a78ba2a26adde7945/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk_cluster.py#L344) (March 2026) written in `CuteDSL`, utilizes a Multi-CTA design and L2 cache optimization to bypass the voting overhead entirely.
+Later a cluster specific multiple CTA supported [version](https://github.com/NVIDIA/TensorRT-LLM/pull/12354) also written in cudsl, was introduced into TRT-LLM in March 19 2026. The distributed shared memory accessing was supported via inline pseudo assembly PTX: 
 
-It’s worth noting that while current research still highlights Single-Pass/Single-CTA modes in Chapter 5.1, the actual production kernels have evolved toward Multi-CTA clusters. However, as noted in Chapter 5.1, using the L2 cache as a synchronization bridge across successive iterations still introduces significant latency, which remains a primary bottleneck for multi-round execution.
+```ptx
+mapa.shared::cluster.u32 dest_reg, src_shmem_ptr, target_cta_id
+```
+
+It’s worth noting that while the research paper still highlights Single-Pass/Single-CTA modes in Chapter **5.1**, the actual production kernels have evolved toward Multi-CTA clusters. However, as noted in Chapter 5.1, using the L2 cache as a synchronization bridge across successive iterations still introduces significant latency, which remains a primary bottleneck for multi-round execution.
 
 ## Reference
 
@@ -131,6 +138,9 @@ It’s worth noting that while current research still highlights Single-Pass/Sin
 [7] Technical Deep Dive : How to Use FlagOS’s New Triton-TLE Language to Build a TopK Selector Faster Than FlashInfer, https://medium.com/@baaiflagopen/technical-deep-dive-how-to-use-flagoss-new-triton-tle-language-to-build-a-topk-selector-faster-97d1c8354953; Accessed on April 30 2026
 
 [8] Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation, https://arxiv.org/pdf/2604.22312, Long Cheng, Ritchie Zhao, Timmy Liu, Mindy Li, Xianjie Qiao, Kefeng Duan, Yu-Jung Chen, Xiaoming Chen, Bita Darvish Rouhani, and June Yang; Accessed on April 27 2026
+
+[9] (4-round 11-bit radix select) Parallel top-k algorithms on GPU:  A comprehensive study and new methods, Jingrong Zhang, Akira Naruse, Xipeng Li, and Yong Wang, SC23:  International Conference for High Performance Computing,
+Networking, Storage and Analysis, 2023; codes : https://github.com/ZhangJingrong/gpu_topK_benchmark/tree/master/include; accessed on April 30 2026 
 
 
 ## Citation
