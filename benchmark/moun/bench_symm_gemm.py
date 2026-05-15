@@ -266,11 +266,11 @@ def calculate_diff(m, dummy):
 
     start = time.time()
     start_event.record()
-    for _ in range(10):
+    for _ in range(iters):
         o_triton_fp8 = thunder_moun_gemm(xq_fp8, wq_fp8, xs_0, xs_1)
     end_event.record()
     torch.cuda.synchronize()
-    triton_v2_time = (time.time() - start) / 10 * 1000
+    triton_v2_time = (time.time() - start) / iters * 1000
     triton_v2_device_elapsed = start_event.elapsed_time(end_event) / iters
 
     for _ in range(warmup):
@@ -282,11 +282,11 @@ def calculate_diff(m, dummy):
 
     start = time.time()
     start_event.record()
-    for _ in range(10):
+    for _ in range(iters):
          o_triton_fp8_ref = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
     end_event.record()
     torch.cuda.synchronize()
-    triton_v1_time = (time.time() - start) / 10 * 1000
+    triton_v1_time = (time.time() - start) / iters * 1000
     triton_v1_device_elapsed = start_event.elapsed_time(end_event) / iters
 
     print(f"\nPerformance:")
