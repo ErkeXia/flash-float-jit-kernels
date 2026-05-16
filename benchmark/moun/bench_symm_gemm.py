@@ -1,5 +1,6 @@
 import itertools
 import os
+import time
 from typing import Any, Optional, Tuple
 
 import torch
@@ -7,11 +8,7 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from jit_kernel.triton3_4.symm_gemm import thunder_moun_gemm, fp8_gemm_block_scaled
-
-from pdb import set_trace
-
-import time
+from jit_kernel.triton3_4.symm_gemm import fp8_gemm_block_scaled, thunder_moun_gemm
 
 SEED = 42
 
@@ -193,10 +190,14 @@ def calculate_diff(m, dummy):
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
 
-    x = torch.arange(m, dtype=torch.float16, device='cuda').view(1, -1) / (m-1) + torch.arange(m, dtype=torch.float16, device='cuda').view(-1, 1) / (m-1)
-    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device='cuda')
-    xs_1 = torch.ones((triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device='cuda')
-    
+    x = torch.arange(m, dtype=torch.float16, device="cuda").view(1, -1) / (
+        m - 1
+    ) + torch.arange(m, dtype=torch.float16, device="cuda").view(-1, 1) / (m - 1)
+    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
     xq = x
     wq = x
 
@@ -213,28 +214,42 @@ def calculate_diff(m, dummy):
     # print("wq : ", wq)
 
     print("x.shape : ", x.shape)
-    print("xs_0.shape : ", xs_0.shape) 
-    print("xs_1.shape : ", xs_1.shape)   
+    print("xs_0.shape : ", xs_0.shape)
+    print("xs_1.shape : ", xs_1.shape)
 
     o_torch_ref = (x @ x.T).cpu()
-    o_triton_fp8 = thunder_moun_gemm(xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1).cpu()
+    o_triton_fp8 = thunder_moun_gemm(
+        xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1
+    ).cpu()
 
     # print("troch ref : ", o_torch_ref)
     # print("o_triton_fp8 : ", o_triton_fp8)
-    
+
     # print("diff (torch): ", o_torch_ref - o_triton_fp8)
 
-    torch.testing.assert_close(
-        o_torch_ref, o_triton_fp8, rtol=2e-02, atol=1e-03
-    )
+    torch.testing.assert_close(o_torch_ref, o_triton_fp8, rtol=2e-02, atol=1e-03)
 
-    o_triton_fp8_ref = fp8_gemm_block_scaled(xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1).cpu()
+    o_triton_fp8_ref = fp8_gemm_block_scaled(
+        xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1
+    ).cpu()
 
     # print("o_triton_fp8_ref : ", o_triton_fp8_ref)
 
     # print("diff (triton): ", o_triton_fp8 - o_triton_fp8_ref)
 
-    # print("o_triton_fp8_ref : ", o_triton_fp8_ref)
+    torch.testing.assert_close(o_triton_fp8_ref, o_triton_fp8, rtol=2e-02, atol=1e-03)
+
+    o_triton_fp8_tril_ref = fp8_gemm_block_scaled(
+        xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1, is_symm=True
+    ).cpu()
+
+    # print("o_triton_fp8_ref (symm) : ", o_triton_fp8_tril_ref)
+
+    # print("diff (triton symm): ", o_triton_fp8 - o_triton_fp8_tril_ref)
+
+    torch.testing.assert_close(
+        o_triton_fp8_tril_ref, o_triton_fp8, rtol=2e-02, atol=1e-03
+    )
 
     print(f"✅ {m}x{m}x{m} thunder_moun_gemm")
     torch.cuda.synchronize()
@@ -242,20 +257,36 @@ def calculate_diff(m, dummy):
     warmup = 25
     iters = 100
     for _ in range(warmup):
-        _ = (x @ x.T)
+        _ = x @ x.T
     torch.cuda.synchronize()
-    
+
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     start = time.time()
     start_event.record()
     for _ in range(iters):
-        _ = (x @ x.T)
+        _ = x @ x.T
     end_event.record()
     torch.cuda.synchronize()
     torch_time = (time.time() - start) / iters * 1000
     torch_device_elapsed = start_event.elapsed_time(end_event) / iters
+
+    for _ in range(warmup):
+        _ = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1, is_symm=True)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        o_triton_fp8 = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1, is_symm=True)
+    end_event.record()
+    torch.cuda.synchronize()
+    triton_v3_time = (time.time() - start) / iters * 1000
+    triton_v3_device_elapsed = start_event.elapsed_time(end_event) / iters
 
     for _ in range(warmup):
         _ = thunder_moun_gemm(xq_fp8, wq_fp8, xs_0, xs_1)
@@ -275,7 +306,7 @@ def calculate_diff(m, dummy):
 
     for _ in range(warmup):
         _ = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
-    torch.cuda.synchronize()    
+    torch.cuda.synchronize()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -283,18 +314,34 @@ def calculate_diff(m, dummy):
     start = time.time()
     start_event.record()
     for _ in range(iters):
-         o_triton_fp8_ref = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
+        o_triton_fp8_ref = fp8_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
     end_event.record()
     torch.cuda.synchronize()
     triton_v1_time = (time.time() - start) / iters * 1000
     triton_v1_device_elapsed = start_event.elapsed_time(end_event) / iters
 
     print(f"\nPerformance:")
-    print(f"PyTorch:            {torch_time:.3f} ms, device {torch_device_elapsed:.3f} ms")
-    print(f"Triton V1 kernel  : {triton_v1_time:.3f} ms, device {triton_v1_device_elapsed:.3f} ms")
-    print(f"Triton V2 kernel  : {triton_v2_time:.3f} ms, device {triton_v2_device_elapsed:.3f} ms")
-    print(f"Speedup (V1)      : {torch_time/triton_v1_time:.2f}x, {torch_device_elapsed / triton_v1_device_elapsed:.2f}x")
-    print(f"Speedup (V2)      : {torch_time/triton_v2_time:.2f}x, {torch_device_elapsed / triton_v2_device_elapsed:.2f}x")
+    print(
+        f"PyTorch                      : {torch_time:.3f} ms, device {torch_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Triton V1 kernel             : {triton_v1_time:.3f} ms, device {triton_v1_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Triton ThunderMoun kernel    : {triton_v2_time:.3f} ms, device {triton_v2_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Triton V3 kernel             : {triton_v3_time:.3f} ms, device {triton_v3_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Speedup (V1)                 : {torch_time/triton_v1_time:.2f}x, {torch_device_elapsed / triton_v1_device_elapsed:.2f}x"
+    )
+    print(
+        f"Speedup (ThunderMoun) kernel : {torch_time/triton_v2_time:.2f}x, {torch_device_elapsed / triton_v2_device_elapsed:.2f}x"
+    )
+    print(
+        f"Speedup (V3)                 : {torch_time/triton_v3_time:.2f}x, {torch_device_elapsed / triton_v3_device_elapsed:.2f}x"
+    )
 
 
 M = [2048, 4096, 8192]
@@ -302,36 +349,48 @@ dummy = [1]
 
 configs = list(itertools.product(M, dummy))
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["m","dummy"],
+        x_names=["m", "dummy"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "triton_impl_v1", "triton_fp8_gemm_ref"],
-        line_names=["torch", "triton_muon_symm_gemm", "trition_fp8_gemm_ref"],
-        styles=[("red", "-"), ("blue", "-"), ("green","-")],
+        line_vals=[
+            "torch",
+            "triton_impl_v1",
+            "triton_fp8_gemm_ref",
+            "triton_fp8_gemm_tril_ref",
+        ],
+        line_names=[
+            "torch",
+            "triton_muon_symm_gemm",
+            "trition_fp8_gemm_ref",
+            "triton_fp8_gemm_tril_ref",
+        ],
+        styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("orange", "-")],
         ylabel="Latency",
         plot_name="muon-symm-gemm-performance",
         args={},
     )
 )
-def benchmark(m:int, dummy:int, provider) -> None:
+def benchmark(m: int, dummy: int, provider) -> None:
     torch.manual_seed(SEED)
 
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
 
     # x = torch.arange(256, dtype=torch.float16, device='cuda').view(1, -1) / 255.0 + torch.arange(256, dtype=torch.float16, device='cuda').view(-1, 1) / 255.0
-    
-    x = torch.randn(m, m, dtype=torch.bfloat16, device='cuda')
-    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device='cuda')
-    xs_1 = torch.ones((triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device='cuda')
-    
+
+    x = torch.randn(m, m, dtype=torch.bfloat16, device="cuda")
+    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
     xq = x
     wq = x
 
-    # x = torch.randn(m, m, dtype=torch.float16, device='cuda')
-
+    # NOTE (yiakwy) : this can be computed asynchronously before Muon update
     # xq, xs_0 = act_quant(x)
     # wq, xs_1 = fp8_weight_block_wise_quant(x)
 
@@ -341,11 +400,13 @@ def benchmark(m:int, dummy:int, provider) -> None:
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-        fn = lambda : x @ x.T
+        fn = lambda: x @ x.T
     elif provider == "triton_impl_v1":
-        fn = lambda : thunder_moun_gemm(x_fp8, wq_fp8, xs_0, xs_1)
+        fn = lambda: thunder_moun_gemm(x_fp8, wq_fp8, xs_0, xs_1)
     elif provider == "triton_fp8_gemm_ref":
-        fn = lambda : fp8_gemm_block_scaled(x_fp8, wq_fp8, xs_0, xs_1)
+        fn = lambda: fp8_gemm_block_scaled(x_fp8, wq_fp8, xs_0, xs_1)
+    elif provider == "triton_fp8_gemm_tril_ref":
+        fn = lambda: fp8_gemm_block_scaled(x_fp8, wq_fp8, xs_0, xs_1, is_symm=True)
 
     # warm up
     for _ in range(10):
@@ -355,6 +416,7 @@ def benchmark(m:int, dummy:int, provider) -> None:
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     return ms * 1000, min_ms * 1000, max_ms * 1000
+
 
 if __name__ == "__main__":
     # Correctness check - simplified for CI
