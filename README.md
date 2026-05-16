@@ -21,7 +21,7 @@ This repository is complemntary of "FlashFloat" with JIT Kernels
 
 <h2 id="Ultra-Low-Latency-TopK-Indexer">🔥 Ultra Low Latency TopK Indexer</h2>
 
-The introduction of the NSA (Native Sparse Attention) mechanism in DeepSeek V3.2 has become pivotal for mitigating inference latency in long-context language modeling. While the NSA top-k indexer playing a critical role in reducing computational overhead for DeepSeek V32 long context sequence modeling task[1], DeepSeek V4 [2] [3], recently, further pushes the context window limit to 1 million tokens where selecting top-2048 dimensions in hybrid sparse attention along from upto 1-M context is a prohibitive bottlenect upto **0.1** ms per layer per query token for agentic workflow.
+The introduction of the NSA (Native Sparse Attention) mechanism in DeepSeek V3.2 has become pivotal for mitigating inference latency in long-context language modeling. While the NSA top-k indexer playing a critical role in reducing computational overhead for DeepSeek V32 long context sequence modeling task [1], DeepSeek V4 [2] [3], recently, further pushes the context window limit to 1 million tokens where selecting top-2048 dimensions in hybrid sparse attention along from upto 1-M context is a prohibitive bottlenect upto **0.1** ms per layer per query token for agentic workflow.
 
 Leveraging the latest SGLang (2026.3) as the benchmark, we investigated the root causes of this latency bottleneck: kernels for conventional throughput-optimized GPU designs suffer from low device utilization in low-batch yet long context decoding scenarios, due to insufficient inter-block coordination [4]. For example, on-chip network has been maturely adopted for many years in the processors such as Graphcore IPU, Cerebras WSE and Groq LPU, but only being introduced into Hopper lately since 2022. By exploiting the limited on-chip communication capabilities of the Hopper architecture  (upto 8 blocks per cluster), through hardware-aware alorithm-hardware co-design, we achieve more than **50%** latency reduction in low-batch yet long context decoding scenarios, demonstrating the effectiveness of synergistic optimization and **NoC** for long-context inference:
 
@@ -49,7 +49,7 @@ We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding
 
 - First we compute historgram in parallel to reduce collision rates per block and then accumulate the histogram via NoC network before N-ways prefix sum and prove this is an effective method to reduce latency for a throughput oriented hardware design. 
 
-- Second, we enhance the linear mapping properties for radix sort in **NSA** problem for reduction of radix sorting iterations; insteadd of traditional top **8/11/13** bits [9] of IEEE FP32, FP16 format, we redesign the linear mapping such that $bin(x) >= bin(y)$, naturally deducing $x >= y$. 
+- Second, we enhance the linear mapping properties for radix sort in **NSA** problem for reduction of radix sorting iterations; instead of traditional top **8/11/13** bits [9] of IEEE FP32, FP16 format, we redesign the linear mapping such that $bin(x) >= bin(y)$, naturally deducing $x >= y$. 
 
   With this linear mapping design, we greatly reduced per block elements dropped in the threshold bin in redix sorting scheme and greatly reduce the residual numbers in later rounds.
   
@@ -59,7 +59,7 @@ We hence propose **Distributed Radix Sort via NoC** to extremely reduce decoding
 - Finally, when remainder elements reduced to **8**/**16**, we can simply use **CAS** operations to performa a **neat parallel sorting** in few cycles. This further reduce the latency overhead in the last round.
 <br/>
 
-Previously, L2 cache was commonly used in NVGPU/AMD GPU to trackle the problem, for example in MoE Align Block Multi Block Execution Algorithm published 2025 [5], we tackle this problem by introducing mathematically equivalent **unaligned parallel prefix sum**. With distributed radix sort, we further prove that on-chip network can further reduce latency of our kernel, facilitating new design of algorithm and software for **1-M** context.
+Previously, L2 cache was commonly used in NVGPU/AMD GPU to trackle the problem, for example in MoE Multi Block Block Size Align Sort Algorithm published 2025 [5], we tackle this problem by introducing mathematically equivalent **unaligned parallel prefix sum**. With distributed radix sort, we further prove that on-chip network can further reduce latency of our kernel, facilitating new design of algorithm and software for **1-M** context.
 
 <br/>
 
@@ -109,7 +109,7 @@ Traditional ballot-based voting relies on expensive bit-shifting operations (a m
 ```
 
 **Compared to TRT-LLM production codebase**
-The whole algorithm is  based on the earlier [two stages solution: topKPerRowDecode](https://github.com/NVIDIA/TensorRT-LLM/blame/v1.3.0rc10/cpp/tensorrt_llm/kernels/indexerTopK.cu), see [the details](https://github.com/NVIDIA/TensorRT-LLM/blame/628bb566050d693894ddf22de03581dd101747c3/cpp/tensorrt_llm/kernels/indexerTopK.cu#L743) in TRT-LLM **v1.3.0rc10**, this largely limited its peak perfmance in 1-M context scenarios.
+The whole algorithm is based on the earlier [two stages solution: topKPerRowDecode](https://github.com/NVIDIA/TensorRT-LLM/blame/v1.3.0rc10/cpp/tensorrt_llm/kernels/indexerTopK.cu), see [the details](https://github.com/NVIDIA/TensorRT-LLM/blame/628bb566050d693894ddf22de03581dd101747c3/cpp/tensorrt_llm/kernels/indexerTopK.cu#L743) in TRT-LLM **v1.3.0rc10**, this largely limited its peak perfmance in 1-M context scenarios.
 
 Recognizing this, the new approach [ballot-free kernel](https://github.com/NVIDIA/TensorRT-LLM/pull/12236) was integrated into TRT-LLM on March 16 2026. This implementation, written in cutedsl, leverages a Multi-CTA architecture with L2-cache-assisted synchronization to eliminate warp-level voting dependencies.
 
