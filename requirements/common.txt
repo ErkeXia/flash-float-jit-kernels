@@ -1,0 +1,18 @@
+# build
+setuptools-scm>=8.0
+setuptools>=61.0
+
+# torch
+torch==2.8.0
+torchao==0.13.0
+torchaudio==2.8.0
+torchcodec==0.7.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.9.1 for torch 2.9.x. Not available on Linux ARM.
+torchvision
+
+# tvm-ffi
+apache-tvm-ffi==0.1.10
+triton==3.4.0
+
+# baseline for benchmark
+sglang==0.5.10 # 0.5.10.post2.dev720+g8043374dd
+sgl_kernel==0.4.1
