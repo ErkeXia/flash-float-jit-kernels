@@ -186,8 +186,6 @@ struct HopperWGMMAAccumulator {
 
     __device__ inline void add_(const HopperWGMMAAccumulator& b) {
         const int wgs = blockDim.x / WARP_GROUP_SIZE;
-
-        // 以 M 分块的数量
         const int M_STEPS = BM / FRAG_M / wgs;
 
         #pragma unroll
@@ -280,11 +278,10 @@ struct HopperWGMMAExecutor {
 
         const int wgs = blockDim.x / WARP_GROUP_SIZE;
 
-        // 以 M 分块的数量
         const int M_STEPS = AccType::BM / FRAG_M / wgs;
 
-        constexpr int N_STEPS = AccType::BN / FRAG_N; // 以 N 分块的数量
-        constexpr int K_STEPS = AccType::BK / FRAG_K; // 以 K 分块的数量
+        constexpr int N_STEPS = AccType::BN / FRAG_N;
+        constexpr int K_STEPS = AccType::BK / FRAG_K;
 
         float* reg_ptr = accum.get_reg_ptr();
 

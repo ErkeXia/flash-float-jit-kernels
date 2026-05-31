@@ -108,7 +108,6 @@ struct HopperPersistentSplitKPipeline {
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
 
-
         int split_k_id = blockIdx.x;
         int split_k = gridDim.x;
 
@@ -330,7 +329,7 @@ struct HopperPersistentSplitKPipeline {
                 HopperWGMMAExecutor::commit_and_wait();
                 // asm volatile("" ::: "memory");
 
-                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile);
+                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 accum.add_(local_step_accum);
                 __syncwarp();
 
