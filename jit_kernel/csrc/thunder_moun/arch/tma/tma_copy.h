@@ -8,14 +8,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include <cuda_runtime.h>
 
 namespace nvgpu {
-namespace arch {
+namespace arch{
 
-template<int BLOCK_SIZE_K, bool Atom = false>
-constexpr CUtensorMapSwizzle get_tma_swizzle_mode();
-
-namespace tma {} // namespace tma
+// __device__ __inline__ void tma2d_load_async(int inner_dim_offset, int outter_dim_offset);
 
 } // namespace arch
 } // namespace nvgpu
-
-#include "tma_desc_impl.h"

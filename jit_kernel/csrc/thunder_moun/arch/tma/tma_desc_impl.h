@@ -7,9 +7,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include "tma_desc.h"
 
 namespace nvgpu {
-namespace arch{
+namespace arch {
 
-template<int BLOCK_SIZE_K, bool Atom = false>
+template<int BLOCK_SIZE_K, bool Atom>
 constexpr CUtensorMapSwizzle get_tma_swizzle_mode() {
     constexpr int N = BLOCK_SIZE_K;
 #if CUDA_VERSION >= 12080

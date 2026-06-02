@@ -23,6 +23,8 @@ IS_CI = (
 OCP_FP8E4M3_MAX = 448.0
 FP8_MAX = OCP_FP8E4M3_MAX
 
+DEBUG = False
+
 
 @triton.jit
 def fp8_weight_block_wise_quant_kernel(
@@ -268,6 +270,9 @@ def calculate_diff(m, dummy):
     print(f"✅ {m}x{m}x{m} thunder_moun_gemm")
     torch.cuda.synchronize()
 
+    if DEBUG:
+        return
+
     warmup = 25
     iters = 100
     for _ in range(warmup):
@@ -484,5 +489,6 @@ if __name__ == "__main__":
         calculate_diff(*cfg)
 
     print("\n" + "=" * 60)
-    print("Starting performance benchmark...")
-    benchmark.run(print_data=True)
+    if not DEBUG:
+        print("Starting performance benchmark...")
+        benchmark.run(print_data=True)

@@ -64,11 +64,14 @@ namespace cg = cooperative_groups;
 
 constexpr int K_BLOCK_M = 128; // 64;
 constexpr int K_BLOCK_N = 128;
-constexpr int K_BLOCK_K = 128; // 64
+constexpr int K_BLOCK_K = 128; // 64;
 
 constexpr int K_STAGES = 4;
 
 constexpr int MAX_SPLIT_K = 8;
+
+constexpr int CLUSTER_SIZE_M = 4;
+constexpr int GROUP_SIZE_M = 4;
 
 // 8 warps per block
 #ifndef WARP_SIZE
@@ -79,8 +82,6 @@ constexpr int NUM_WARPS = 8; // 12
 
 constexpr int TOTAL_WARP_THREADS = NUM_WARPS * WARP_SIZE;
 
-// __cluster_dims__(MAX_SPLIT_K, 1, 1)
-
 extern "C" __global__
 void hopper_symm_gemm_kernel_entry(
     const __nv_fp8_e4m3* __restrict__ X,
@@ -88,9 +89,9 @@ void hopper_symm_gemm_kernel_entry(
     const float* __restrict__ scale_X,
     const float* __restrict__ scale_W,
     half* __restrict__ Out,
-    int M, int N, int K,
-    int total_symmetric_tiles,
-    int num_blocks_n,
+    const int M, const int N, const int K,
+    const int total_symmetric_tiles,
+    const int num_blocks_m, const int num_blocks_n, const int cluster_size_m,
     __grid_constant__ const CUtensorMap tma_desc_X,
     __grid_constant__ const CUtensorMap tma_desc_W)
 {
@@ -111,17 +112,49 @@ void hopper_symm_gemm_kernel_entry(
     // }
     // __syncthreads();
 
-    xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES>::run_persistent(
-        accumulator_fragment,
-        &tma_desc_X,
-        &tma_desc_W,
-        scale_X,
-        scale_W,
-        Out, M, N, K,
-        total_symmetric_tiles,
-        num_blocks_n,
-        smem_buffer
-    );
+    if (cluster_size_m < 8) {
+        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 4>::run_persistent(
+            accumulator_fragment,
+            &tma_desc_X,
+            &tma_desc_W,
+            scale_X,
+            scale_W,
+            Out, M, N, K,
+            total_symmetric_tiles,
+            num_blocks_m,
+            num_blocks_n,
+            smem_buffer
+        );
+    } else
+    if (cluster_size_m < 4) {
+        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 2>::run_persistent(
+            accumulator_fragment,
+            &tma_desc_X,
+            &tma_desc_W,
+            scale_X,
+            scale_W,
+            Out, M, N, K,
+            total_symmetric_tiles,
+            num_blocks_m,
+            num_blocks_n,
+            smem_buffer
+        );
+    } else
+    if (cluster_size_m < 2) {
+        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 1>::run_persistent(
+            accumulator_fragment,
+            &tma_desc_X,
+            &tma_desc_W,
+            scale_X,
+            scale_W,
+            Out, M, N, K,
+            total_symmetric_tiles,
+            num_blocks_m,
+            num_blocks_n,
+            smem_buffer
+        );
+    }
+
 }
 
 // TVM-FFI raw C interface for JIT kernel invocation
@@ -194,7 +227,9 @@ extern "C" int symm_gemm_fp8_block_scaled(
     }
 }
 #else
-// TODO (yiakwy)
+
+#error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
+
 #endif
 
     uint64_t shape_w[2] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N)};
@@ -220,13 +255,16 @@ extern "C" int symm_gemm_fp8_block_scaled(
     }
 }
 #else
-// TODO (yiakwy)
+
+#error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
+
 #endif
 
     auto& kernel = hopper_symm_gemm_kernel_entry;
 
-    uint32_t required_smem_bytes = K_STAGES * (sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) +
-                                               sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>)) + sizeof(xpu::SharedBlock<fp32_t, K_BLOCK_M, K_BLOCK_N>) + 1024;
+    uint32_t required_smem_bytes = sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) * K_STAGES +
+                                   sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
+                                   sizeof(xpu::SharedBlock<fp32_t, K_BLOCK_M, K_BLOCK_N>);
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, required_smem_bytes);
 
@@ -256,8 +294,8 @@ extern "C" int symm_gemm_fp8_block_scaled(
     dim3 grid(split_k, grid_mn, 1);
     dim3 block(TOTAL_WARP_THREADS, 1, 1);
 
-    // TODO (yiakwy) : add TMA multicast along GROUP_SZIE_M
-    const int GROUP_SIZE_M = 1;
+    // TODO (yiakwy) : add TMA multicast along GROUP_SIZE_M
+    const int cluster_size_m = 1;  // CEILDIV(CLUSTER_SIZE_M, split_k);
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
     cudaLaunchConfig_t launch_config = {0};
@@ -271,15 +309,15 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     cudaLaunchAttribute attr;
     attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim = {split_k, GROUP_SIZE_M, 1};
+    attr.val.clusterDim = {split_k, (unsigned int)cluster_size_m, 1};
     launch_config.attrs = &attr;
     launch_config.numAttrs = 1;
 
-    // printf("[symm_gemm_fp8_block_scaled] launching stream-split-k (%d) grid_mn#%d with groups %d multcast kernel via NoC...\n", split_k, grid_mn, GROUP_SIZE_M);
+    // printf("[symm_gemm_fp8_block_scaled] launching stream-split-k (%d) grid_mn#%d with groups %d (%d x %d), %d (%dx1) multcast kernel via NoC...\n", split_k, grid_mn, GROUP_SIZE_M, GROUP_SIZE_M, GROUP_SIZE_M, cluster_size_m, cluster_size_m);
 
     cudaError_t state = cudaLaunchKernelEx(&launch_config, kernel,
         (const fp8_t*)X_ptr, (const fp8_t*)W_ptr, (const fp32_t*)scale_X, (fp32_t*)scale_W, (fp16_t*)Out_ptr,
-        M, N, K, total_symmetric_tiles, num_blocks_n, desc_X, desc_W
+        M, N, K, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m, desc_X, desc_W
     );
 
     if (state != cudaSuccess) {
@@ -290,6 +328,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     // printf("[symm_gemm_fp8_block_scaled] launching stream-split-k kernel with L2 cache...\n");
     // launch with L2 cache
+#error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
 
 #endif
     return 0;

@@ -15,7 +15,6 @@ struct FragmentView {
 
     __device__ inline FragmentView(T* smem) : shared_ptr(smem) {}
 
-    // 将底层逻辑坐标 (m, n) 映射到共享内存暂存区，用于跨块或线程间重新对齐
     __device__ inline T& operator()(int m, int n) {
         return shared_ptr[m * BN + n];
     }
