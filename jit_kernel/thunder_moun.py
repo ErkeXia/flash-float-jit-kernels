@@ -43,7 +43,11 @@ _PY_SYMBOL = "symmetric_gemm_fp8_block_scaled"
 common_cuda_flags = ["-O2", "-std=c++17"]
 
 
-major = torch.cuda.get_device_capability()[0]
+if torch.cuda.is_available():
+    major, _minor = torch.cuda.get_device_capability()
+else:
+    major = 0
+
 if major >= 9:
     common_cuda_flags += [
         "-Xcompiler",
@@ -103,10 +107,21 @@ def symm_gemm_block_scaled(
         xs_rhs: block scale of type torch[float16] for x, of shape (N // SCALE_BLOCK_SIZE_N, K // SCALE_BLOCK_SIZE_K), by default row major
         use_fp8: use fp8 if True
     Returns:
-        The topk indices tensor of shape (B, topk)
+        The output tensor of shape (M, M)
     """
     if check_input_shape:
         assert xq.dim() >= 2, "xq must be >= 2 dims"
+
+        assert xq.is_cuda and wq.is_cuda, "xq/wq must be CUDA tensors"
+        assert xq.shape[-1] == wq.shape[-1], "xq and wq must have the same K dimension"
+        assert xq.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ), "xq must be FP8 e4m3"
+        assert wq.dtype == xq.dtype, "wq must have the same dtype as xq"
+        assert (
+            xs_lhs.dtype == torch.float32 and xs_rhs.dtype == torch.float32
+        ), "xs_lhs/xs_rhs must be float32 scales"
 
         if is_column_major(xq):
             warnings.warn(

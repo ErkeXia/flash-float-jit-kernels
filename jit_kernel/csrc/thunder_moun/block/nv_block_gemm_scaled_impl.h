@@ -19,11 +19,17 @@ namespace cg = cooperative_groups;
 #define WARP_SIZE 32
 #endif
 
+#ifndef SWIZZLE_64B_STORE
+#define SWIZZLE_64B_STORE 0
+#endif
+
 namespace cg = cooperative_groups;
 
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
 #define USE_CLUSTER_MULTICAST 0
+
+#define USE_INPALCE_TRI_TRANSPOSE 1
 
 namespace nvgpu {
 namespace arch {
@@ -70,6 +76,8 @@ struct HopperPersistentSplitKPipeline {
         HopperWGMMAAccumulator<BM, BN, BK>& accum,
         const CUtensorMap* tma_desc_X,
         const CUtensorMap* tma_desc_W,
+        const CUtensorMap* tma_desc_O,
+        const CUtensorMap* tma_desc_O_swizzle,
         const float* scale_X,
         const float* scale_W,
         half* Out,
@@ -83,6 +91,7 @@ struct HopperPersistentSplitKPipeline {
         using fp32_t = float;
 
         using AccDtype = fp32_t;
+        using OutDtype = half;
 
 
         const int tid = threadIdx.x;
@@ -102,8 +111,8 @@ struct HopperPersistentSplitKPipeline {
 
         int threads_per_block = blockDim.x;
 
-        AccDtype* epilogue_smem = reinterpret_cast<AccDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
-        FragmentView<AccDtype, BM, BN, MemoryDomain::kShared> frag_view(epilogue_smem);
+        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
+        FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
         constexpr uint32_t tma_bytes_X = BM * BK;
         constexpr uint32_t tma_bytes_W = BN * BK;
@@ -111,7 +120,7 @@ struct HopperPersistentSplitKPipeline {
         constexpr uint32_t total_stage_bytes = tma_bytes_X + tma_bytes_W;
 
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
-        constexpr int K_TILES_TOTAL = (8092 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
+        constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
         __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
@@ -189,6 +198,7 @@ struct HopperPersistentSplitKPipeline {
             // }
 
             // NOTE (yaikwy) : group swizzle after Down-Left Triangular Mapping for better L2 cache locality in TMA load
+            if constexpr (GROUP_SIZE_M > 1)
             {
                 // Grouping for better L2 cache locality in TMA load
                 const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
@@ -467,7 +477,7 @@ struct HopperPersistentSplitKPipeline {
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
-            accum.store(epilogue_smem);
+            accum.store(shmem_epilogue);
             __syncthreads();
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -488,62 +498,90 @@ struct HopperPersistentSplitKPipeline {
             if (split_k > 1) {
                 if (split_k_id == 0) {
                     for (int r = 1; r < split_k; ++r) {
-                        AccDtype* dst_epilogue_smem = cluster.map_shared_rank<AccDtype>(&epilogue_smem[0], r);
+                        OutDtype* dst_shmem_epilogue = cluster.map_shared_rank<OutDtype>(&shmem_epilogue[0], r);
 
                         for (int idx = tid; idx < BM * BN; idx += threads_per_block) {
-                            // // if (blockIdx.y == 1 && idx == (BM - 1) * BN) {
-                            // if (blockIdx.y == 2 && idx == BM * BN - 1) {
-                            //     printf("[Epilogue] [idx#%d] [Split#%d] [SM#%d] block#(%d, %d) read from split_k#%d partial result for reduction: epilogue_smem[idx]=%f, dst_epilogue_smem[idx]=%f\n", threadIdx.x, split_k_id, blockIdx.y, block_idx_m, block_idx_n, r, epilogue_smem[idx], dst_epilogue_smem[idx]);
-                            // }
-                            // __syncthreads();
-                            atomicAdd(&epilogue_smem[idx], dst_epilogue_smem[idx]);
+                            shmem_epilogue[idx] += dst_shmem_epilogue[idx];
                         }
                     }
                 }
             } //  split_k > 1
-            cluster.sync();
+
+            __syncthreads();
 
             if (split_k_id == 0) {
-                // write to lower left
-                for (int idx = threadIdx.x; idx < BM * BN; idx += threads_per_block) {
-                    int local_m = idx / BN;
-                    int local_n = idx % BN;
+                if (threadIdx.x == 0) {
+                    uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
+                    uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
 
-                    // float val = frag_view(local_m, local_n);
-                    float val = static_cast<float>(epilogue_smem[idx]);
-
-                    // // if (blockIdx.y == 1 && idx == (BM - 1) * BN) {
-                    // if (blockIdx.y == 2 && idx == BM * BN - 1) {
-                    //     printf("[Epilogue] [idx#%d] [Split#%d] [SM#%d] block#(%d, %d) read from partial result for reduction: epilogue_smem[idx]=%f, val[%d, %d]=%f\n", threadIdx.x, split_k_id, blockIdx.y, block_idx_m, block_idx_n, epilogue_smem[idx], local_m, local_n, val);
-                    // }
-                    // __syncthreads();
-
-                    int global_m = block_idx_m * BM + local_m;
-                    int global_n = block_idx_n * BN + local_n;
-                    if (global_m < M && global_n < N) {
-                        Out[global_m * N + global_n] = static_cast<half>(val);
-                    }
+                    asm volatile (
+                        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                        " [%0, {%2, %3}], [%1];"
+                        :
+                        : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                        "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                        : "memory"
+                    );
                 }
-                __syncthreads();
 
-                // transpose copy to upper right
+                // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
-                    for (int idx = threadIdx.x; idx < BM * BN; idx += threads_per_block) {
-                        int local_m = idx / BN;
-                        int local_n = idx % BN;
-
-                        // float val = frag_view(local_m, local_n);
-                        half val = static_cast<half>(epilogue_smem[idx]);
-
-                        int sym_global_m = block_idx_n * BN + local_n;
-                        int sym_global_n = block_idx_m * BM + local_m;
-                        if (sym_global_m < M && sym_global_n < N) {
-                            Out[sym_global_m * N + sym_global_n] = val;
-                        }
+#ifdef USE_INPALCE_TRI_TRANSPOSE && USE_INPALCE_TRI_TRANSPOSE
+                    if (threadIdx.x == 0) {
+                        asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                     }
-                }
-                __syncthreads();
-            }
+                    __syncthreads();
+
+                    // NOTE (yiakwy) : inplace transpose
+                    frag_view._transpose();
+#else
+                    // TODO (yiakwy) : outplace transpose
+                    // NOTE (yiakwy) : outplace transpose
+#endif // USE_INPALCE_TRI_TRANSPOSE
+                    if (threadIdx.x == 0) {
+#if SWIZZLE_64B_STORE
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
+#else
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
+#endif
+                        uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
+
+#if SWIZZLE_64B_STORE
+                        asm volatile (
+                            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                            " [%0, {%2, %3}], [%1];"
+                            :
+                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                            "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                            : "memory"
+                        );
+
+                        const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
+
+                        asm volatile (
+                            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                            " [%0, {%2, %3}], [%1];"
+                            :
+                            : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
+                                "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                            : "memory"
+                        );
+#else
+                        asm volatile (
+                            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                            " [%0, {%2, %3}], [%1];"
+                            :
+                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                            "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            : "memory"
+                        );
+#endif
+                    }
+
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+                } // block_idx_m > block_idx_n
+            } // split_id == 0
             cluster.sync();
 #else
             for (int idx = threadIdx.x; idx < BM * BN; idx += threads_per_block) {
@@ -551,7 +589,7 @@ struct HopperPersistentSplitKPipeline {
                 int local_n = idx % BN;
 
                 // float val = frag_view(local_m, local_n);
-                half val = static_cast<half>(epilogue_smem[idx]);
+                half val = static_cast<half>(shmem_epilogue[idx]);
 
                 // write to lower left
                 int global_m = block_idx_m * BM + local_m;

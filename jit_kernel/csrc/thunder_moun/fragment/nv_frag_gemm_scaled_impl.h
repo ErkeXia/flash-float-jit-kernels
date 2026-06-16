@@ -3,7 +3,13 @@ Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 
 #pragma once
+#include <type_traits>
+
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
+
+#include <cuda_bf16.h>
+
 #include "fragment.h"
 
 #ifndef WARP_GROUP
@@ -107,7 +113,8 @@ struct HopperWGMMAAccumulator {
         return row * BN + col;
     }
 
-    __device__ inline void store(float* smem) {
+    template<typename Dtype>
+    __device__ inline void store(Dtype* smem) {
         const int warp_id = threadIdx.x / WARP_SIZE;
         // const int lane_id = threadIdx.x % WARP_SIZE;
 
@@ -128,7 +135,12 @@ struct HopperWGMMAAccumulator {
             #pragma unroll
             for (int i = 0; i < kRegistersPerThread; ++i) {
                 int smem_offset = getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS);
-                smem[smem_offset] = regs[m_step][i];
+
+                if constexpr (!std::is_same_v<Dtype, AccDtype>) {
+                    smem[smem_offset] = static_cast<Dtype>(regs[m_step][i]);
+                } else {
+                    smem[smem_offset] = regs[m_step][i];
+                }
 
                 // // if (blockIdx.y == 1 && (smem_offset == 127 * 128)) {
                 // if (blockIdx.y == 2 && (smem_offset == 127 * 128 + 127)) {
