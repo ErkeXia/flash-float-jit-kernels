@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 name = "flash-float-jit-kernel"
 authors = [{name = "yiakwy, and other flash-float authors"}]
 license = { "file"= "LICENSE" }
-description = "A high-throughput and memory-efficient kernel library for low bit floats of LLM inference"
+description = "A low latency yet high-throughput and memory-efficient kernel library for low bit floats of LLM inference"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
