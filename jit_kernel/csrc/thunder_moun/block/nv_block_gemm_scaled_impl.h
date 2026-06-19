@@ -117,6 +117,8 @@ struct HopperPersistentSplitKPipeline {
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
 
+        __shared__ __align__(128) OutDtype *dst[8];
+
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int s = 0; s < STAGES; ++s) {
@@ -606,21 +608,19 @@ struct HopperPersistentSplitKPipeline {
 
             if (split_k > 1) {
                 if (split_k_id == 0) {
-                    // for (int r = 1; r < split_k; ++r) {
-                    //     OutDtype* dst_shmem_epilogue = cluster.map_shared_rank<OutDtype>(&shmem_epilogue[0], r);
-
-                    //     for (int idx = tid; idx < BM * BN; idx += threads_per_block) {
-                    //         shmem_epilogue[idx] += dst_shmem_epilogue[idx];
-                    //     }
-                    // }
-
-                    for (int idx = tid; idx < BM * BN; idx += threads_per_block) {
-                        float sum;
+                    if (threadIdx.x == 0) {
                         for (int r = 1; r < split_k; ++r) {
                             OutDtype* dst_shmem_epilogue = cluster.map_shared_rank<OutDtype>(&shmem_epilogue[0], r);
-                            sum += static_cast<float>(dst_shmem_epilogue[idx]);
+                            dst[r] = dst_shmem_epilogue;
                         }
-                        shmem_epilogue[idx] += static_cast<half>(sum);
+                    }
+                    __syncthreads();
+
+                    for (int r = 1; r < split_k; ++r) {
+                        OutDtype* dst_shmem_epilogue = dst[r];
+                        for (int idx = tid; idx < BM * BN; idx += threads_per_block) {
+                            shmem_epilogue[idx] += dst_shmem_epilogue[idx];
+                        }
                     }
                 }
             } //  split_k > 1
