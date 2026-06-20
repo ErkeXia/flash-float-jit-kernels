@@ -20,6 +20,20 @@ __device__ __inline__ void tma2d_multicast_load_async(void* smem_ptr/*smem dest*
                                                       const int32_t inner_dim_offset, const int32_t outter_dim_offset,
                                                       uint16_t cluster_mask, uint64_t cache_hint);
 
+__device__ __inline__ void tma2d_load_async(void* smem_ptr/*smem dest*/, void const * tma_desc_ptr/*gmem src*/,
+                                            uint64_t* s_w_mbar_ptr, /*mbarrier*/
+                                            const int32_t inner_dim_offset, const int32_t outter_dim_offset,
+                                            uint64_t cache_hint);
+
+__device__ __inline__ void tma2d_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
+                                            uint32_t s_w_mbar_addr, /*mbarrier*/
+                                            const int32_t inner_dim_offset, const int32_t outter_dim_offset,
+                                            uint64_t cache_hint);
+
+
+__device__ __inline__ void tma2d_store(uint64_t tma_addr/*gmem dest*/, uint32_t smem_epilogue_addr /*smem src*/,
+                                       const int32_t inner_dim_offset, const int32_t outter_dim_offset);
+
 } // namespace arch
 } // namespace nvgpu
 

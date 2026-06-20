@@ -25,7 +25,7 @@ __device__ __forceinline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arri
 } // namespace internal
 
 template<bool MULTI_CAST = false>
-__device__ __forceinline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arrive) {
+__device__ __forceinline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arrive = 1) {
     if constexpr (MULTI_CAST) {
         internal::tma_init_barrier(bar_ptr, num_arrive/*CLUSTER_SIZE_M*/);
     } else {
