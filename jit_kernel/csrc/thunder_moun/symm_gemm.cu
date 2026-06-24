@@ -78,7 +78,7 @@ constexpr int MAX_SPLIT_K = 8;
 
 constexpr int GROUP_SIZE_M = 16;
 // NOTE (yiakwy) : see our paper for details
-constexpr int CLUSTER_SIZE_M = GROUP_SIZE_M / 2;
+constexpr int CLUSTER_SIZE_M = 2; // GROUP_SIZE_M / 2;
 
 // 8 warps per block
 #ifndef WARP_SIZE
