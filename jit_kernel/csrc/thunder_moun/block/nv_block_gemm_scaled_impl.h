@@ -24,7 +24,7 @@ namespace cg = cooperative_groups;
 #endif
 
 #ifndef SWIZZLE_64B_STORE
-#define SWIZZLE_64B_STORE 0
+#define SWIZZLE_64B_STORE 1
 #endif
 
 namespace cg = cooperative_groups;
@@ -80,11 +80,7 @@ struct HopperPersistentSplitKPipeline {
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
-
-        asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(cluster_rank) : );
-
-        // TODO (yiakwy):
-        // cluster_rank = nvgpu::arch::cluster_ctarank();
+        cluster_rank = nvgpu::arch::cluster_ctarank();
 
         auto cluster = cooperative_groups::this_cluster();
         auto clusterDim = cluster.dim_blocks();
@@ -130,7 +126,7 @@ struct HopperPersistentSplitKPipeline {
         __syncthreads();
 
         uint64_t cache_hint_lhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_NORMAL);
-        uint64_t cache_hint_rhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_LAST);
+        uint64_t cache_hint_rhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_NORMAL);
 
         int split_k_id = blockIdx.x;
         int split_k = gridDim.x;

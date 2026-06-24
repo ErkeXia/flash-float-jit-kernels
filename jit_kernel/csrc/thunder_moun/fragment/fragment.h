@@ -52,13 +52,9 @@ struct FragmentView {
 
         constexpr int M_STEPS = BM / FRAG_M;
 
-        constexpr int sub_tasks_0 = (M_STEPS * M_STEPS - M_STEPS) / 2;
-        constexpr int sub_tasks_1 = M_STEPS;
+        constexpr int total_diagonal_pairs = (FRAG_M * FRAG_M - FRAG_M) / 2;
 
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
-        //     printf("[_transpose] [Split#%d] [SM#%d] step 1 transpose non-diag data, M_STEPS=%d ...\n", blockIdx.x, blockIdx.y, M_STEPS);
-        // }
-        // __syncthreads();
+        constexpr int SWIZZLE_SHIFT = (sizeof(T) == 2) ? 3 : 2;
 
         // NOTE (yiakwy) : process lower left sub fragment
         #pragma unroll
@@ -76,44 +72,37 @@ struct FragmentView {
                     int thr_col = e_idx % FRAG_M;
                     int thr_row = e_idx / FRAG_M;
 
+                    int row_src = sub_frag_idx_m_off + thr_row;
+                    int col_src = sub_frag_idx_n_off + thr_col;
+
+                    int row_dst = sub_frag_idx_n_off + thr_col;
+                    int col_dst = sub_frag_idx_m_off + thr_row;
+
+                    int src_idx, dst_idx;
+
                     // NOTE(yiakwy) : only valid for 16x16 fragment
 #if SWIZZLE_64B_STORE
                     int swizzle_col = thr_col ^ (thr_row % 8);
                     int swizzle_row = thr_row ^ (thr_col % 8);
 
-                    // (sub_frag_idx_m_off + thr_row, sub_frag_idx_n_off + swizzle_col)
-                    T src_val = shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + swizzle_col];
+                    int swizzle_col_src = col_src ^ ((row_src & 7) << SWIZZLE_SHIFT);
+                    int swizzle_col_dst = col_dst ^ ((row_dst & 7) << SWIZZLE_SHIFT);
 
-                    // (sub_frag_idx_n_off + thr_row, sub_frag_idx_m_off + swizzle_col)
-                    T dst_val = shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + swizzle_row];
+                    src_idx = row_src * BM + swizzle_col_src;
+                    dst_idx = row_dst * BM + swizzle_col_dst;
 #else
+                    src_idx = row_src * BM + col_src;
+                    dst_idx = row_dst * BM + col_dst;
+
                     int swizzle_col = thr_col;
                     int swizzle_row = thr_row;
-
-                    // (sub_frag_idx_m_off + thr_row, sub_frag_idx_n_off + swizzle_col)
-                    T src_val = shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + thr_col];
-
-                    // (sub_frag_idx_n_off + thr_row, sub_frag_idx_m_off + swizzle_col)
-                    T dst_val = shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + thr_row];
 #endif
 
+                    T src_val = shared_ptr[src_idx];
+                    T dst_val = shared_ptr[dst_idx];
 
-#if SWIZZLE_64B_STORE
-                    shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + swizzle_col] = dst_val;
-                    shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + swizzle_row] = src_val;
-#else
-                    shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + thr_col] = dst_val;
-                    shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + thr_row] = src_val;
-#endif
-
-                    // if (sub_frag_idx_m == 7 && sub_frag_idx_n == 0 && thr_row == 15 && thr_col == 0) {
-                    //     printf("[Debug] [_transpose] src[%d, %d] -> dst[%d, %d], dst[%d, %d] -> src[%d, %d]\n",
-                    //     sub_frag_idx_m_off + thr_row, sub_frag_idx_n_off + swizzle_col,
-                    //     sub_frag_idx_n_off + thr_col, sub_frag_idx_m_off + thr_row,
-                    //     sub_frag_idx_n_off + thr_col, sub_frag_idx_m_off + swizzle_row,
-                    //     sub_frag_idx_m_off + thr_row, sub_frag_idx_n_off + thr_col);
-                    // }
-
+                    shared_ptr[src_idx] = dst_val;
+                    shared_ptr[dst_idx] = src_val;
                 } // end of e_idx
 
             } // end of sub_frag_idx_n
@@ -121,51 +110,41 @@ struct FragmentView {
         } // end of sub_frag_idx_m
         __syncthreads();
 
-
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
-        //     printf("[_transpose] [Split#%d] [SM#%d] step 2 transpose diag data ...\n", blockIdx.x, blockIdx.y);
-        // }
-        // __syncthreads();
-
-
         #pragma unroll
-        for (int task_idx = 0; task_idx < sub_tasks_1; task_idx++) {
+        for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
 
             int sub_frag_idx_m_off = task_idx * FRAG_M;
             int sub_frag_idx_n_off = task_idx * FRAG_M;
 
-            int pair_counter = 0;
+            for (int pair_idx = tid; pair_idx < total_diagonal_pairs; pair_idx += threads_per_block) {
+                int thr_row = static_cast<int>((1 + __fsqrt_rn(1 + 8 * pair_idx)) / 2);
+                int thr_col = pair_idx - (thr_row * (thr_row - 1)) / 2;
 
-            // for (int e_idx = tid; e_idx < (FRAG_M * FRAG_M - FRAG_M) / 2; e_idx += threads_per_block) {
-            #pragma unroll
-            for (int thr_row = 1; thr_row < FRAG_M; ++thr_row) {
+                int row_src = sub_frag_idx_m_off + thr_row;
+                int col_src = sub_frag_idx_n_off + thr_col;
 
-                #pragma unroll
-                for (int thr_col = 0; thr_col < thr_row; ++thr_col) {
+                int row_dst = sub_frag_idx_n_off + thr_col;
+                int col_dst = sub_frag_idx_m_off + thr_row;
 
-                    if (pair_counter % threads_per_block == tid) {
+                int src_idx, dst_idx;
+
 #if SWIZZLE_64B_STORE
-                        int swizzle_col = thr_col ^ (thr_row % 8);
-                        int swizzle_row = thr_row ^ (thr_col % 8);
+                int swizzle_col_src = col_src ^ ((row_src & 7) << SWIZZLE_SHIFT);
+                int swizzle_col_dst = col_dst ^ ((row_dst & 7) << SWIZZLE_SHIFT);
 
-                        T src_val = shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + swizzle_col];
-                        T dst_val = shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + swizzle_row];
-
-                        shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + swizzle_row] = src_val;
-                        shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + swizzle_col] = dst_val;
+                src_idx = row_src * BM + swizzle_col_src;
+                dst_idx = row_dst * BM + swizzle_col_dst;
 #else
-                        T src_val = shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + thr_col];
-                        T dst_val = shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + thr_row];
-
-                        shared_ptr[(sub_frag_idx_n_off + thr_col) * BM + sub_frag_idx_m_off + thr_row] = src_val;
-                        shared_ptr[(sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + thr_col] = dst_val;
+                src_idx = row_src * BM + col_src;
+                dst_idx = row_dst * BM + col_dst;
 #endif
-                    }
-                    pair_counter++;
 
-                } // end of thr_col
+                T src_val = shared_ptr[src_idx];
+                T dst_val = shared_ptr[dst_idx];
 
-            } // end of e_idx
+                shared_ptr[src_idx] = dst_val;
+                shared_ptr[dst_idx] = src_val;
+            }
 
         } // end of task_idx
 

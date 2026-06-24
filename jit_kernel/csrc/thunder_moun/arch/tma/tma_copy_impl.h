@@ -26,7 +26,7 @@ __device__ __inline__ void tma2d_multicast_load_async(void* smem_ptr/*smem dest*
                                                       const int32_t inner_dim_offset, const int32_t outter_dim_offset,
                                                       uint16_t cluster_mask, uint64_t cache_hint) {
 
-    uint32_t smem_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
     const uint64_t tma_desc_addr = reinterpret_cast<uint64_t>(tma_desc_ptr);
     uint32_t s_w_mbar_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
 
@@ -38,7 +38,7 @@ __device__ __inline__ void tma2d_load_async(void* smem_ptr/*smem dest*/, void co
                                             uint64_t* s_w_mbar_ptr, /*mbarrier*/
                                             const int32_t inner_dim_offset, const int32_t outter_dim_offset,
                                             uint64_t cache_hint) {
-    uint32_t smem_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
     const uint64_t tma_desc_addr = reinterpret_cast<uint64_t>(tma_desc_ptr);
     uint32_t s_w_mbar_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
 
