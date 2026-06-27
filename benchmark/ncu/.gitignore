@@ -1,0 +1,6 @@
+reports/
+*.ncu-rep
+*.qdrep
+*.sqlite
+*_raw.csv
+*_source.csv
