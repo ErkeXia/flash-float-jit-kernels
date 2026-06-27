@@ -106,8 +106,10 @@ restore_output_ownership() {
 
 run_one cuda_warm "cuda_m${M}"
 run_one triton_symm_native_warm "triton_symm_m${M}"
+run_one triton_moun_native_warm "triton_moun_m${M}"
 export_report_csv "cuda_m${M}"
 export_report_csv "triton_symm_m${M}"
+export_report_csv "triton_moun_m${M}"
 restore_output_ownership
 
 cat <<EOF
@@ -115,12 +117,15 @@ cat <<EOF
 Reports:
   ${OUT_DIR}/cuda_m${M}.ncu-rep
   ${OUT_DIR}/triton_symm_m${M}.ncu-rep
+  ${OUT_DIR}/triton_moun_m${M}.ncu-rep
 
 Raw/source CSV exports:
   ${NCU} -i ${OUT_DIR}/cuda_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/cuda_m${M}_raw.csv
   ${NCU} -i ${OUT_DIR}/cuda_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/cuda_m${M}_source.csv
   ${NCU} -i ${OUT_DIR}/triton_symm_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/triton_symm_m${M}_raw.csv
   ${NCU} -i ${OUT_DIR}/triton_symm_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/triton_symm_m${M}_source.csv
+  ${NCU} -i ${OUT_DIR}/triton_moun_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/triton_moun_m${M}_raw.csv
+  ${NCU} -i ${OUT_DIR}/triton_moun_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/triton_moun_m${M}_source.csv
 
 CSV export is enabled by default. To skip it:
 

@@ -33,6 +33,7 @@ The script profiles:
 
 - `cuda_warm`
 - `triton_symm_native_warm`
+- `triton_moun_native_warm`
 
 Both use `benchmark/ncu/ncu_target.py`, which performs warmup first and then
 uses `cudaProfilerStart/Stop`. The `ncu` commands therefore pass
