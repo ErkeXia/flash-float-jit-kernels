@@ -13,6 +13,22 @@ Typical first run from the repository root:
 bash benchmark/ncu/run_ncu_examples.sh
 ```
 
+If the NVIDIA driver restricts performance counters to admin users, the script
+will try to re-run itself with `sudo` while preserving the virtualenv and CUDA
+paths. You can force or disable that behavior with:
+
+```bash
+NCU_SUDO=1 bash benchmark/ncu/run_ncu_examples.sh
+NCU_SUDO=0 bash benchmark/ncu/run_ncu_examples.sh
+```
+
+The script exports CSV files by default so reports are easier to diff or paste
+into reviews. To disable CSV export:
+
+```bash
+EXPORT_CSV=0 bash benchmark/ncu/run_ncu_examples.sh
+```
+
 The script profiles:
 
 - `cuda_warm`
