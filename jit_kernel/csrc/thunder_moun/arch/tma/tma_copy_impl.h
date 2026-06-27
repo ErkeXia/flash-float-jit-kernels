@@ -53,7 +53,7 @@ __device__ __inline__ void tma2d_load_async(uint32_t smem_addr/*smem dest*/, con
         "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
         " [%0], [%1, {%3, %4}], [%2], %5;\n"
         :
-        : "r"(smem_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_addr)), "r"(s_w_mbar_addr),
+        : "r"(smem_addr), "l"(tma_desc_addr), "r"(s_w_mbar_addr),
         "r"(inner_dim_offset), "r"(outter_dim_offset), "l"(cache_hint)
     );
 }

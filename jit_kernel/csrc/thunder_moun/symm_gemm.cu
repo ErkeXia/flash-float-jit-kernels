@@ -358,14 +358,16 @@ extern "C" int symm_gemm_fp8_block_scaled(
         split_k = 1;
     }
 
-    dim3 grid(split_k, grid_mn, 1);
-    dim3 block(TOTAL_WARP_THREADS, 1, 1);
-
-    // TODO (yiakwy) : add TMA multicast along GROUP_SIZE_M
     int cluster_size_m = MIN(4, CLUSTER_SIZE_M);
     if (grid_mn % cluster_size_m != 0) {
         cluster_size_m = 1;
     }
+
+    int max_split_k = CEILDIV(MAX_SPLIT_K, cluster_size_m);
+    split_k = MIN(split_k, max_split_k);
+
+    dim3 grid(split_k, grid_mn, 1);
+    dim3 block(TOTAL_WARP_THREADS, 1, 1);
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
     cudaLaunchConfig_t launch_config = {0};

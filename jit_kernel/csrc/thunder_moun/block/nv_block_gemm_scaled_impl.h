@@ -315,7 +315,6 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                // shmem_XS[s_row * k_tiles + s_col] = scale_X[g_row * stride_xs_m + g_col];
                 shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();

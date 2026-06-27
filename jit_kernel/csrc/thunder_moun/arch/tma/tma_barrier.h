@@ -11,8 +11,8 @@ namespace nvgpu {
 namespace arch {
 
 /*
- * NOTE (yiakwy) : Usaga:
- *   while (!bar_try_wait_once(current_barrier, tma_phases[stage])) {
+ * NOTE (yiakwy) : Usage:
+ *   while (!tma_try_wait_once(current_barrier, tma_phases[stage])) {
  *       asm volatile("nanosleep.u32 64;\n");
  *   }
  */

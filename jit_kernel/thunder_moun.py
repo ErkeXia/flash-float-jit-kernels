@@ -143,7 +143,7 @@ def symm_gemm_block_scaled(
 
     split_k = max(1, K // BLK_K)
 
-    # NOTE (yiakwy) : disable on chip split_k reduction for the moment
+    # NOTE (yiakwy) : disable on chip split_k reduction via NoC for the moment
     split_k = 1
 
     if out is None:
