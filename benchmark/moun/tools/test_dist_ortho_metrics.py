@@ -478,14 +478,14 @@ def test_training_manager_orthogonality(rank: int, world_size: int):
         # verify momentum of mlp_bank is ill-conditioned (cond > 100)
         if "mlp_bank" in pre_results:
             cond = pre_results["mlp_bank"]["momentum_cond"]
-            print(f"\nmlp_bank pre-step 动量条件数: {cond:.2e} (预期 > 100)")
-            assert cond > 100.0, f"mlp_bank 动量应病态，但 cond={cond:.2e}"
+            print(f"\nmlp_bank pre-step momentum condition: {cond:.2e} ( > 100)")
+            assert cond > 100.0, f"mlp_bank momentum ill condition, cond={cond:.2e}"
 
         # check post step momentum condition number of mlp_bank is still ill-conditioned
         if "mlp_bank" in pre_results:
             pre_cond = pre_results["mlp_bank"]["momentum_cond"]
             post_cond = post_results["mlp_bank"]["momentum_cond"]
-            print(f"mlp_bank 动量条件数变化: {pre_cond:.2e} -> {post_cond:.2e}")
+            print(f"mlp_bank momentum change: {pre_cond:.2e} -> {post_cond:.2e}")
 
         print("\n" + "=" * 80)
         print("✅ all tests passed！")
