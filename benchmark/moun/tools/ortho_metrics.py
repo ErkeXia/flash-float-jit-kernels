@@ -219,11 +219,11 @@ def compute_frobenius_orth_error(X: torch.Tensor) -> float:
 
 def compute_matrix_metrics(data, grad, momentum):
     """
-    evluation metrics for 2-dimension matrix and 3-dimension
+    Evaluation metrics for 2-dimensional and 3-dimensional matrices.
     Output:
-        - cond: Condition Number for stability of the 2-dimensional matrix, computed via SVD
-        - orth_error: frobenius ortho deviation error ||XX^T - I||_F
-        - orth_dev: quick frobenius ortho deviation error with triton
+        - cond: Condition number for stability of the 2D matrix, computed via SVD
+        - orth_error: Frobenius orthogonality error ||XX^T - I||_F
+        - orth_dev: Quick orthogonality deviation estimate by Triton
     """
     metrics = {
         "data_cond": float("nan"),
