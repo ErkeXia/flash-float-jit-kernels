@@ -300,7 +300,7 @@ class MockTrainingManager:
 # Main Test
 def test_training_manager_orthogonality(rank: int, world_size: int):
     """
-    Veirfy that the evaluate_condition_and_orthogonality can capture normuon parameters, grads and momentum buffers
+    Verify that evaluate_condition_and_orthogonality can capture NorMuon parameters, grads, and momentum buffers
     correctly before and after step_optimizers in a distributed setting.
     """
 
@@ -421,7 +421,7 @@ def test_training_manager_orthogonality(rank: int, world_size: int):
 
     if is_master:
         print("\n" + "=" * 80)
-        print("测试 step_optimizers 前的评估 (pre-step)")
+        print("pre step_optimizers evaluation (pre-step)")
         print("=" * 80)
 
     from ortho_metrics import evaluate_condition_and_orthogonality
@@ -430,45 +430,37 @@ def test_training_manager_orthogonality(rank: int, world_size: int):
         model, manager.optimizer, step=1, prefix="pre_step"
     )
 
-    from remote_pdb import set_trace
-
-    # set_trace()
-    # ---- 4. 执行 step_optimizers ----
     if is_master:
         print("\n执行 step_optimizers (step=1)...")
     manager.step_optimizers(step=1)
     dist.barrier()
 
-    # ---- 5. 测试 step_optimizers 后的评估 ----
     if is_master:
         print("\n" + "=" * 80)
-        print("测试 step_optimizers 后的评估 (post-step)")
+        print("post step_optimizers evaluation (post-step)")
         print("=" * 80)
 
     post_results = evaluate_condition_and_orthogonality(
         model, manager.optimizer, step=1, prefix="post_step"
     )
 
-    # ---- 6. 验证结果 ----
     if is_master:
         print("\n" + "=" * 80)
-        print("验证结果:")
+        print("Result :")
         print("=" * 80)
 
-        # 验证评估了哪些参数
         expected = [
             k for k, v in manager.param_table.items() if v["optim"] == "normuon"
         ]
         actual = list(pre_results.keys())
-        print(f"预期评估: {expected}")
-        print(f"实际评估: {actual}")
+        print(f"real eval: {expected}")
+        print(f"actual eval: {actual}")
         assert set(expected) == set(
             actual
-        ), f"参数评估不完整: 期望 {expected}, 实际 {actual}"
+        ), f"different parameters: expected {expected}, actual {actual}"
 
-        # 验证每个参数的指标
         for label in expected:
-            print(f"\n[{label}] 前后对比:")
+            print(f"\n[{label}] pre-post:")
             pre = pre_results[label]
             post = post_results[label]
 
@@ -479,30 +471,26 @@ def test_training_manager_orthogonality(rank: int, world_size: int):
                 f"  Post-step: data_cond={post['data_cond']:.2e}, momentum_cond={post['momentum_cond']:.2e}"
             )
 
-            # 合理性断言
             assert pre["data_cond"] >= 1.0 and post["data_cond"] >= 1.0
             assert pre["momentum_cond"] >= 1.0 and post["momentum_cond"] >= 1.0
             assert pre["data_orth_dev"] >= 0 and post["data_orth_dev"] >= 0
 
-        # 特殊验证：mlp_bank 的动量应为病态（在 pre-step 中）
+        # verify momentum of mlp_bank is ill-conditioned (cond > 100)
         if "mlp_bank" in pre_results:
             cond = pre_results["mlp_bank"]["momentum_cond"]
             print(f"\nmlp_bank pre-step 动量条件数: {cond:.2e} (预期 > 100)")
             assert cond > 100.0, f"mlp_bank 动量应病态，但 cond={cond:.2e}"
 
-        # 验证 step_optimizers 后动量缓冲区已更新 (值应发生显著变化)
-        # 简单检查：比较 pre 和 post 的动量条件数是否不同
+        # check post step momentum condition number of mlp_bank is still ill-conditioned
         if "mlp_bank" in pre_results:
             pre_cond = pre_results["mlp_bank"]["momentum_cond"]
             post_cond = post_results["mlp_bank"]["momentum_cond"]
             print(f"mlp_bank 动量条件数变化: {pre_cond:.2e} -> {post_cond:.2e}")
-            # 注意：动量可能仍保持病态，但数值应有所变化
 
         print("\n" + "=" * 80)
-        print("✅ 所有验证通过！")
+        print("✅ all tests passed！")
         print("=" * 80)
 
-    # 清理
     dist.barrier()
     dist.destroy_process_group()
 

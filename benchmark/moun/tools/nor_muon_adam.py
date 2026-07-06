@@ -819,9 +819,11 @@ class NorMuonAndAdam:
                 self._eff_wd_t,
             )
         except Exception as e:
-            from remote_pdb import set_trace
+            try:
+                from remote_pdb import set_trace  # type: ignore
+            except ImportError:
+                set_trace = None
 
-            # set_trace()
             raise RuntimeError(
                 f"Adam update failed for param {p_cfg.label} with shape {p_slice.shape}"
             ) from e

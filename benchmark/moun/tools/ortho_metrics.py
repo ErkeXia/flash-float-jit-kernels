@@ -284,7 +284,7 @@ def compute_matrix_metrics(data, grad, momentum):
             metrics[f"{name}_orth_dev"] = sum(orth_devs) / len(orth_devs)
             metrics[f"{name}_orth_dev_max"] = max(orth_devs)
 
-    # main proutine
+    # main routine
     for tensor, name in [(data, "data"), (grad, "grad"), (momentum, "momentum")]:
         if tensor is not None and tensor.numel() > 0:
             conds, orth_errors, orth_devs = eval_bank(tensor, name)
@@ -314,6 +314,12 @@ def evaluate_condition_and_orthogonality(
         for param, p_cfg in optimizer.param_cfgs.items()
         if p_cfg.optim == "normuon"
     ]
+
+    if eval_params is not None:
+        eval_set = set(eval_params)
+        normuon_params = [
+            (p, cfg) for (p, cfg) in normuon_params if cfg.label in eval_set
+        ]
 
     if not normuon_params:
         if is_master:
