@@ -22,22 +22,15 @@ NCU_SUDO=1 bash benchmark/ncu/run_ncu_examples.sh
 NCU_SUDO=0 bash benchmark/ncu/run_ncu_examples.sh
 ```
 
-The script exports CSV files by default so reports are easier to diff or paste
-into reviews. To disable CSV export:
-
-```bash
-EXPORT_CSV=0 bash benchmark/ncu/run_ncu_examples.sh
-```
-
 The script profiles:
 
-- `cuda_warm`
-- `triton_symm_native_warm`
 - `triton_moun_native_warm`
+- `triton_moun_tvm_ffi_warm`
 
 Both use `benchmark/ncu/ncu_target.py`, which performs warmup first and then
 uses `cudaProfilerStart/Stop`. The `ncu` commands therefore pass
 `--profile-from-start off`, so warmup and Triton compilation are not profiled.
+The script writes only `.ncu-rep` files under `benchmark/ncu/reports`.
 
 Useful Nsight Compute sections to inspect:
 

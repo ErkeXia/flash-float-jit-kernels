@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Example Nsight Compute commands for the symmetric GEMM providers.
+# Profile triton_moun native and TVM-FFI launchers with Nsight Compute.
 #
 # Run from the repository root on the CUDA VM:
 #
 #   bash benchmark/ncu/run_ncu_examples.sh
 #
-# The target script calls cudaProfilerStart/Stop, so these commands use
-# --profile-from-start off to keep warmup and Triton compilation out of the
-# profiled region.
+# The Python target calls cudaProfilerStart/Stop, so --profile-from-start off
+# keeps warmup, Triton compilation, and TVM-FFI inline compilation out of the
+# measured range.
 
 set -euo pipefail
 
 M="${M:-4096}"
 WARMUP="${WARMUP:-10}"
 ITERS="${ITERS:-1}"
+LAUNCH_COUNT="${LAUNCH_COUNT:-1}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 OUT_DIR="${OUT_DIR:-benchmark/ncu/reports}"
 NCU="${NCU:-ncu}"
 NCU_SUDO="${NCU_SUDO:-auto}"
-EXPORT_CSV="${EXPORT_CSV:-1}"
 
 should_reexec_with_sudo() {
   if [[ "${NCU_SUDO}" == "0" || "${NCU_SUDO}" == "false" ]]; then
@@ -60,7 +60,7 @@ COMMON_NCU_ARGS=(
   --set detailed
   --target-processes all
   --profile-from-start off
-  --launch-count 1
+  --launch-count "${LAUNCH_COUNT}"
   --kernel-name-base demangled
   --force-overwrite
 )
@@ -79,24 +79,6 @@ run_one() {
       --poison-output
 }
 
-export_report_csv() {
-  local output_name="$1"
-  local report_path="${OUT_DIR}/${output_name}.ncu-rep"
-  if [[ "${EXPORT_CSV}" != "1" && "${EXPORT_CSV}" != "true" ]]; then
-    return 0
-  fi
-  if [[ ! -f "${report_path}" ]]; then
-    echo "Skipping CSV export; report not found: ${report_path}" >&2
-    return 0
-  fi
-
-  echo "Exporting Nsight Compute CSV pages for ${output_name}."
-  "${NCU}" -i "${report_path}" --page raw --csv > "${OUT_DIR}/${output_name}_raw.csv" ||
-    echo "Failed to export raw page for ${report_path}" >&2
-  "${NCU}" -i "${report_path}" --page source --csv > "${OUT_DIR}/${output_name}_source.csv" ||
-    echo "Failed to export source page for ${report_path}" >&2
-}
-
 restore_output_ownership() {
   if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" && -d "${OUT_DIR}" ]]; then
     chown -R "${SUDO_UID}:${SUDO_GID}" "${OUT_DIR}" ||
@@ -104,40 +86,18 @@ restore_output_ownership() {
   fi
 }
 
-run_one cuda_warm "cuda_m${M}"
-run_one triton_symm_native_warm "triton_symm_m${M}"
-run_one triton_moun_native_warm "triton_moun_m${M}"
-export_report_csv "cuda_m${M}"
-export_report_csv "triton_symm_m${M}"
-export_report_csv "triton_moun_m${M}"
+run_one triton_moun_native_warm "triton_moun_native_m${M}"
+run_one triton_moun_tvm_ffi_warm "triton_moun_tvm_ffi_m${M}"
 restore_output_ownership
 
 cat <<EOF
 
-Reports:
-  ${OUT_DIR}/cuda_m${M}.ncu-rep
-  ${OUT_DIR}/triton_symm_m${M}.ncu-rep
-  ${OUT_DIR}/triton_moun_m${M}.ncu-rep
+Nsight Compute reports:
+  ${OUT_DIR}/triton_moun_native_m${M}.ncu-rep
+  ${OUT_DIR}/triton_moun_tvm_ffi_m${M}.ncu-rep
 
-Raw/source CSV exports:
-  ${NCU} -i ${OUT_DIR}/cuda_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/cuda_m${M}_raw.csv
-  ${NCU} -i ${OUT_DIR}/cuda_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/cuda_m${M}_source.csv
-  ${NCU} -i ${OUT_DIR}/triton_symm_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/triton_symm_m${M}_raw.csv
-  ${NCU} -i ${OUT_DIR}/triton_symm_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/triton_symm_m${M}_source.csv
-  ${NCU} -i ${OUT_DIR}/triton_moun_m${M}.ncu-rep --page raw --csv > ${OUT_DIR}/triton_moun_m${M}_raw.csv
-  ${NCU} -i ${OUT_DIR}/triton_moun_m${M}.ncu-rep --page source --csv > ${OUT_DIR}/triton_moun_m${M}_source.csv
-
-CSV export is enabled by default. To skip it:
-
-  EXPORT_CSV=0 bash benchmark/ncu/run_ncu_examples.sh
-
-If NVIDIA performance counters require admin privileges, this script attempts to
-re-run itself with sudo while preserving the virtualenv and CUDA paths. To force
-that behavior, run:
-
+Useful knobs:
+  M=2048 WARMUP=5 ITERS=1 bash benchmark/ncu/run_ncu_examples.sh
   NCU_SUDO=1 bash benchmark/ncu/run_ncu_examples.sh
-
-To disable automatic sudo re-exec, run:
-
   NCU_SUDO=0 bash benchmark/ncu/run_ncu_examples.sh
 EOF

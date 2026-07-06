@@ -21,6 +21,8 @@ DEFAULT_SCENARIOS = (
     "cuda_warm",
     "triton_moun_native_cold",
     "triton_moun_native_warm",
+    "triton_moun_tvm_ffi_cold",
+    "triton_moun_tvm_ffi_warm",
     "triton_symm_native_cold",
     "triton_symm_native_warm",
 )
@@ -142,6 +144,24 @@ def scenario_config(name: str, args: argparse.Namespace) -> Dict[str, object]:
             "warmup": args.warmup,
             "iters": args.iters,
             "triton_use_tvm_ffi": False,
+        }
+    if name == "triton_moun_tvm_ffi_cold":
+        return {
+            "scenario": name,
+            "provider": "triton_moun",
+            "launcher": "tvm_ffi_cubin_launcher",
+            "warmup": 0,
+            "iters": args.cold_iters,
+            "triton_use_tvm_ffi": True,
+        }
+    if name == "triton_moun_tvm_ffi_warm":
+        return {
+            "scenario": name,
+            "provider": "triton_moun",
+            "launcher": "tvm_ffi_cubin_launcher",
+            "warmup": args.warmup,
+            "iters": args.iters,
+            "triton_use_tvm_ffi": True,
         }
     if name == "triton_symm_native_cold":
         return {

@@ -191,6 +191,15 @@ work_dirs/
 
 !logo.png
 
+# Profiling reports
+benchmark/ncu/reports/
+benchmark/nsys/reports/
+benchmark/profiling/traces/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
 # Prerequisites
 *.d
 
