@@ -235,8 +235,7 @@ def create_mock_model():
 # Mock training manager
 class MockTrainingManager:
     """
-    模拟 TrainingManager，用于单测环境
-    包含完整的 param_table、optimizer 初始化和 step_optimizers 逻辑
+    Mock TrainingManager for GPT2 training task
     """
 
     def __init__(self, model, world_size: int):
@@ -431,7 +430,7 @@ def test_training_manager_orthogonality(rank: int, world_size: int):
     )
 
     if is_master:
-        print("\n执行 step_optimizers (step=1)...")
+        print("\nexecute step_optimizers (step=1)...")
     manager.step_optimizers(step=1)
     dist.barrier()
 
