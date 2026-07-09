@@ -1,4 +1,4 @@
-/* Copyright 2026 flashFloat authors. All Rights Reserved.
+/* Copyright 2025-2026 flashFloat authors. All Rights Reserved.
 Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 

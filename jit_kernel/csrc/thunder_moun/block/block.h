@@ -12,11 +12,6 @@ struct alignas(128) SharedBlock {
     T data[M][N];
 };
 
-struct BlockLaunchParams {
-    int block_m;
-    int block_n;
-    int block_k;
-    int split_k_slices;
-};
+
 
 } // namespace xpu
