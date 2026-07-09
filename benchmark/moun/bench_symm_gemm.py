@@ -9,7 +9,7 @@ import triton.language as tl
 import triton.testing
 
 from jit_kernel.thunder_moun import symm_gemm_block_scaled
-from jit_kernel.triton3_4.symm_gemm import fp8_gemm_block_scaled, thunder_moun_gemm
+from jit_kernel.triton3_5.symm_gemm import fp8_gemm_block_scaled, thunder_moun_gemm
 
 SEED = 42
 

@@ -12,7 +12,7 @@ import torch
 import triton
 
 from jit_kernel.thunder_moun import symm_gemm_block_scaled
-import jit_kernel.triton3_4.symm_gemm as triton_symm_gemm
+import jit_kernel.triton3_5.symm_gemm as triton_symm_gemm
 
 
 SEED = 42
