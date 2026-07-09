@@ -13,11 +13,15 @@ namespace cg = cooperative_groups;
 #include "../arch/tma/tma_barrier.h"
 #include "../arch/cluster/cluster.h"
 
+#include "../arch/warpgroup/reg_allocator.h"
+
 // TODO (yiakwy) : refactor flashFloat FragView with Shape and Layout component with support of device side Flash Float datatype
 
 #include "../tensor/tensor_view_ref.h"
 #include "../fragment/nv_frag_gemm_scaled_impl.h"
+
 #include "block.h"
+#include "producer.h"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -34,18 +38,6 @@ namespace cg = cooperative_groups;
 #define USE_CLUSTER_MULTICAST 1
 
 #define USE_INPALCE_TRI_TRANSPOSE 1
-
-namespace nvgpu {
-namespace arch {
-
-enum class CacheHintSm90 : uint64_t {
-  EVICT_NORMAL = 0x1000000000000000,
-  EVICT_FIRST = 0x12F0000000000000,
-  EVICT_LAST = 0x14F0000000000000,
-};
-
-} // namespace arch
-} // namespace nvgpu
 
 namespace xpu {
 
@@ -221,72 +213,24 @@ struct HopperPersistentSplitKPipeline {
             int read_stage = 0;
 
             // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
-            #pragma unroll
-            for (int i = 0; i < STAGES - 1; ++i) {
-                int current_k = k_start + i;
-                if (current_k < k_end) {
-
-                    // if (threadIdx.x == 0 && blockIdx.x == 0 && i == 0) {
-                    //     printf("[Prefetch] [Split#%d] [SM#%d] Ramp up fill, stage#%d/%d, block#(%d, %d), group_id=%d, group_id * GROUP_SIZE_M=%d\n", blockIdx.x, blockIdx.y, i, STAGES, block_idx_m, block_idx_n, group_id, group_id * GROUP_SIZE_M);
-                    // }
-
-                    // Commit the async copy for the first few stages, and then we will wait on them in the main loop
-                    // NOTE (yiakwy) : see https://github.com/NVIDIA/cutlass/blob/5f06f5fc1a072bbe4815fae7ae8470b876ed603a/include/cute/arch/copy_sm90_tma.hpp#L117 for the recommended way to commit async copy with TMA and mbarrier synchronization.
-                    if (tid == 0) {
-                        uint32_t smem_x_addr = __cvta_generic_to_shared(&shmem_X[write_stage]);
-                        uint32_t smem_w_addr = __cvta_generic_to_shared(&shmem_W[write_stage]);
-
-                        uint32_t s_w_bar_ptr = __cvta_generic_to_shared(&barriers[write_stage]);
-
-                        // asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" :: "r"(s_w_bar_ptr), "r"(total_stage_bytes));
-                        nvgpu::arch::tma_expect_bytes(s_w_bar_ptr, total_stage_bytes);
 
 #if  USE_CLUSTER_MULTICAST
-                        // The 2d tma instruction needs cluster mask to specify the destination of the multicast
-                        if (block_idx_n < group_id * GROUP_SIZE_M) {
-
-                            nvgpu::arch::tma2d_load_async(
-                                smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                                current_k * BK, block_idx_m * BM, cache_hint_lhs
-                            );
-
-                            if (cluster_group_m_rank == 0) {
-                                nvgpu::arch::tma2d_multicast_load_async(
-                                    smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                                    current_k * BK, block_idx_n * BN, cluster_mask, cache_hint_rhs
-                                );
-                            } // end of cluster_group_m_rank == 0
-
-                        } else {
-
-                            // non-multicast version
-                            nvgpu::arch::tma2d_load_async(
-                                smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                                current_k * BK, block_idx_m * BM, cache_hint_lhs
-                            );
-
-                            nvgpu::arch::tma2d_load_async(
-                                smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                                current_k * BK, block_idx_n * BN, cache_hint_rhs
-                            );
-                        } // block_idx_n < group_id * GROUP_SIZE_M
+            producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
+                tid, group_id, block_idx_m, block_idx_n,
+                k_start, k_end, total_stage_bytes,
+                tma_desc_X, tma_desc_W,
+                shmem_X, shmem_W, barriers,
+                cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
+                write_stage/*src & dst*/);
 #else
-
-                        nvgpu::arch::tma2d_load_async(
-                            smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                            current_k * BK, block_idx_m * BM, cache_hint_lhs
-                        );
-
-                        nvgpu::arch::tma2d_load_async(
-                            smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                            current_k * BK, block_idx_n * BN, cache_hint_rhs
-                        );
+            producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
+                tid, group_id, block_idx_m, block_idx_n,
+                k_start, k_end, total_stage_bytes,
+                tma_desc_X, tma_desc_W,
+                shmem_X, shmem_W, barriers,
+                cache_hint_lhs, cache_hint_rhs,
+                write_stage/*src & dst*/);
 #endif
-                    } //  end of thread 0
-
-                    write_stage = (write_stage + 1) % STAGES;
-                }
-            }
 
             // if (threadIdx.x == 0 && blockIdx.x == 0) {
             //     printf("[Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
@@ -363,59 +307,26 @@ struct HopperPersistentSplitKPipeline {
 
                 int next_k = k_tile + (STAGES - 1);
                 if (next_k < k_end) {
-                    if (threadIdx.x == 0) {
-                        uint32_t smem_x_addr = __cvta_generic_to_shared(&shmem_X[write_stage]);
-                        uint32_t smem_w_addr = __cvta_generic_to_shared(&shmem_W[write_stage]);
-
-                        uint32_t s_w_bar_ptr = __cvta_generic_to_shared(&barriers[write_stage]);
-
-                        // asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" :: "r"(s_w_bar_ptr), "r"(total_stage_bytes));
-                        nvgpu::arch::tma_expect_bytes(s_w_bar_ptr, total_stage_bytes);
 
 #if  USE_CLUSTER_MULTICAST
-                        // The 2d tma instruction needs cluster mask to specify the destination of the multicast
-                        if (block_idx_n < group_id * GROUP_SIZE_M) {
-                            nvgpu::arch::tma2d_load_async(
-                                smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                                next_k * BK, block_idx_m * BM, cache_hint_lhs
-                            );
-
-                            if (cluster_group_m_rank == 0) {
-                                nvgpu::arch::tma2d_multicast_load_async(
-                                    smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                                    next_k * BK, block_idx_n * BN, cluster_mask, cache_hint_rhs
-                                );
-                            } // end of cluster_rank == 0
-
-                        } else {
-                            // non-multicast version
-                            nvgpu::arch::tma2d_load_async(
-                                smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                                next_k * BK, block_idx_m * BM, cache_hint_lhs
-                            );
-
-                            nvgpu::arch::tma2d_load_async(
-                                smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                                next_k * BK, block_idx_n * BN, cache_hint_rhs
-                            );
-
-                        } // block_idx_n < group_id * GROUP_SIZE_M
-
+                    producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load_once(
+                        tid, group_id,
+                        next_k, block_idx_m, block_idx_n, total_stage_bytes,
+                        tma_desc_X, tma_desc_W,
+                        shmem_X, shmem_W, barriers,
+                        cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs, write_stage, tma_phase
+                    );
 #else
-                        // non-multicast version
-                        nvgpu::arch::tma2d_load_async(
-                            smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
-                            next_k * BK, block_idx_m * BM, cache_hint_lhs
-                        );
-
-                        nvgpu::arch::tma2d_load_async(
-                            smem_w_addr, reinterpret_cast<uint64_t>(tma_desc_W), s_w_bar_ptr,
-                            next_k * BK, block_idx_n * BN, cache_hint_rhs
-                        );
+                    producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load_once(
+                        tid, group_id,
+                        next_k, block_idx_m, block_idx_n, total_stage_bytes,
+                        tma_desc_X, tma_desc_W,
+                        shmem_X, shmem_W, barriers,
+                        cache_hint_lhs, cache_hint_rhs, write_stage, tma_phase
+                    );
 #endif
-                    } // end of thread 0
-                    write_stage = (write_stage + 1) % STAGES;
-                }
+
+                } // next_k < k_end
 
                 HopperWGMMAExecutor::commit_and_wait();
 

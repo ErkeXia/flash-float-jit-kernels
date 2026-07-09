@@ -26,7 +26,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 namespace xpu {
 
-// 专门为 Hopper 架构设计的 WGMMA 累加寄存器 Fragment
+// WGMMA register based fragment accumulator
 template <int _BM, int _BN, int _BK>
 struct HopperWGMMAAccumulator {
     using AccDtype = float;
@@ -398,21 +398,6 @@ struct HopperWGMMAExecutor {
                         "+f"(reg_ptr[reg_offset + 60]), "+f"(reg_ptr[reg_offset + 61]), "+f"(reg_ptr[reg_offset + 62]), "+f"(reg_ptr[reg_offset + 63])
                         : "l"(desc_x), "l"(desc_w)
                     );
-
-                    /*
-                    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-                    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-
-                    // if (threadIdx.x == 255 && blockIdx.x == 1 && blockIdx.y == 2) {
-                    if (threadIdx.x == 255 && blockIdx.x == 0 && blockIdx.y == 0) {
-                        printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] reg[%d ~ %d] = \n", wg_id, m_step, k_step, reg_offset, reg_offset + reg_num_per_frag - 1);
-                        for (int i = 0; i < 64; ++i) {
-                            printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] RegAcc[%d] = %f \n", wg_id, m_step, k_step, i, reg_ptr[reg_offset + i]);
-                        }
-                        printf("\n");
-                    }
-                    __syncthreads();
-                    */
 
                 } // K_STEPS
 

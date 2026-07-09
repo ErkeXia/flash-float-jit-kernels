@@ -36,9 +36,12 @@ cuda_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/block.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/producer.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/fragment.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/nv_frag_gemm_scaled_impl.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/array_ref.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/layout.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tuple.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tensor_view_ref.h"),
 ]
@@ -63,6 +66,7 @@ if major >= 9:
         "-DENABLE_HOPPER=1",
         "-arch=compute_90a",
         "-code=sm_90a",
+        "-I " + str(KERNEL_PATH / "csrc" / "thunder_moun"),
     ]
 
 

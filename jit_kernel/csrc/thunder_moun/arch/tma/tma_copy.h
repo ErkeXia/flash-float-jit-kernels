@@ -10,6 +10,12 @@ Licensed under the Apache License, Version 2.0 (the "License");
 namespace nvgpu {
 namespace arch {
 
+enum class CacheHintSm90 : uint64_t {
+  EVICT_NORMAL = 0x1000000000000000,
+  EVICT_FIRST = 0x12F0000000000000,
+  EVICT_LAST = 0x14F0000000000000,
+};
+
 __device__ __inline__ void tma2d_multicast_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
                                                       uint32_t s_w_mbar_addr, /*mbarrier*/
                                                       const int32_t inner_dim_offset, const int32_t outter_dim_offset,

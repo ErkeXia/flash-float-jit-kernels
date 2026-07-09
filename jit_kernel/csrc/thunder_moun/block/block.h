@@ -12,6 +12,4 @@ struct alignas(128) SharedBlock {
     T data[M][N];
 };
 
-
-
 } // namespace xpu

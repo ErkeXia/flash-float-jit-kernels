@@ -8,7 +8,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 #include <ostream>
 
-#define HOST_DEVICE __host__ __device__
+// #define HOST_DEVICE __host__ __device__
 
 #define USE_ARRAY_REF true
 
