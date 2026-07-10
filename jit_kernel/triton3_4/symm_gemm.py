@@ -70,7 +70,7 @@ def _remmap_pid(tile_id, tall_xcds, BLOCKS_PER_XCD, NUM_XCDS):
     return tile_id
 
 
-# see our paper
+# NOTE (yiakwy) : see our paper for cuda kernel for swizzle of lower left triangle
 # pid = pid_m * (pid_m + 1) / 2 + pid_n
 # pid_m*2 + pid_m - 2*pid - pid_n = 0
 @triton.jit
