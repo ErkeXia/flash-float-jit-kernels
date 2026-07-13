@@ -11,6 +11,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from packaging import version
 
+USE_TVM_FFI = False
+
+tvm_ffi_modules = {
+    "XXT": None,
+}
+
 
 # NOTE (yiakwy) : useful for multiple-die chiplet architecture :
 #   - Blackwell(2 dies), Rubin(2 dies),
@@ -92,7 +98,8 @@ if version.parse(triton.__version__) < version.parse("3.6"):
 
 
     @triton.jit
-    def swizzle2d(pid, grid_m, grid_n, GROUP_M: tl.constexpr):
+    def swizzle2d(i, j, grid_m, grid_n, GROUP_M: tl.constexpr):
+        pid = i * grid_n + j
         width = GROUP_M * grid_n
 
         group_id = pid // width
@@ -100,7 +107,7 @@ if version.parse(triton.__version__) < version.parse("3.6"):
         group_size = min(grid_m - first_pid_m, GROUP_M)
         tl.assume(group_size >= 0)
         pid_m = first_pid_m + (pid % group_size)
-        pid_n = (pid % width) // (group_size)
+        pid_n = (pid % width) // group_size
         return pid_m, pid_n
     
     # NOTE (yiakwy) : FIX newer triton API
@@ -202,7 +209,104 @@ def XXT_kernel(
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
 
-def XXT(A: torch.Tensor, out: torch.Tensor):
+def _xxt_config(K: int):
+    if K == 768:
+        return 128, 128, 64, 4, 8
+    return 64, 128, 128, 4, 8
+
+
+def _xxt_tvm_ffi(
+    A: torch.Tensor,
+    out: torch.Tensor,
+    M: int,
+    K: int,
+    batch_size: int,
+    input_batch_stride: int,
+    output_batch_stride: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    BLOCK_SIZE_K: int,
+    num_stages: int,
+    num_warps: int,
+):
+    import tvm_ffi
+
+    from jit_kernel.triton3_5.tvm_ffi_mod import generate_tvm_ffi_source
+
+    global tvm_ffi_modules
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    key = (
+        str(A.dtype),
+        str(out.dtype),
+        M,
+        K,
+        batch_size,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        num_stages,
+        num_warps,
+    )
+
+    cache = tvm_ffi_modules["XXT"]
+    if cache is not None and key in cache:
+        module, kernel_name, gx, gy, gz = cache[key]
+    else:
+        compiled_kernel = XXT_kernel[grid](
+            A_ptr=A,
+            C_ptr=out,
+            M=M,
+            K=K,
+            a_stride_b=input_batch_stride,
+            a_stride_r=A.stride(-2),
+            a_stride_c=A.stride(-1),
+            c_stride_b=output_batch_stride,
+            c_stride_r=out.stride(-2),
+            c_stride_c=out.stride(-1),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+            LOWER_UPPER=1,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        cubin_bytes = compiled_kernel.kernel
+        kernel_name = compiled_kernel.name
+        sources, _constants = generate_tvm_ffi_source(compiled_kernel, kernel_name)
+        module = tvm_ffi.cpp.load_inline(
+            "triton3_5_xxt_loader",
+            cuda_sources=sources,
+            extra_ldflags=["-lcudart", "-lcuda"],
+            embed_cubin={"triton_cubin": cubin_bytes},
+        )
+
+        gx, gy, gz = int(grid[0]), 1, 1
+        if tvm_ffi_modules["XXT"] is None:
+            tvm_ffi_modules["XXT"] = {}
+        tvm_ffi_modules["XXT"][key] = (module, kernel_name, gx, gy, gz)
+
+    getattr(module, kernel_name)(
+        A,
+        out,
+        int(M),
+        int(K),
+        int(input_batch_stride),
+        int(A.stride(-2)),
+        int(A.stride(-1)),
+        int(output_batch_stride),
+        int(out.stride(-2)),
+        int(out.stride(-1)),
+        int(gx),
+        int(gy),
+        int(gz),
+    )
+    return out
+
+
+def XXT(A: torch.Tensor, out: torch.Tensor, use_tvm_ffi: Optional[bool] = None):
     """
     Launch Triton kernel to compute C = A @ A.T
     """
@@ -215,13 +319,24 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
 
-    # Hardcoded configs based on H100 autotuning
-    if K == 768:
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-        num_stages, num_warps = 4, 8
-    else:
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
-        num_stages, num_warps = 4, 8
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps = _xxt_config(K)
+
+    use_ffi = USE_TVM_FFI if use_tvm_ffi is None else use_tvm_ffi
+    if use_ffi:
+        return _xxt_tvm_ffi(
+            A,
+            out,
+            M,
+            K,
+            batch_size,
+            input_batch_stride,
+            output_batch_stride,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            num_stages,
+            num_warps,
+        )
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
