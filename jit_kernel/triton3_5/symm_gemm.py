@@ -16,6 +16,7 @@ USE_TVM_FFI = False
 tvm_ffi_modules = {
     "XXT": None,
     "fp8_gemm_block_scaled": None,
+    "thunder_moun_gemm": None,
 }
 
 
@@ -33,6 +34,11 @@ if is_hopper():
     NUM_CUs = SMs
 else:
     raise Exception("Not supported yet!")
+
+
+class LoadBalanceStrategy(Enum):
+    UNDEFINE = -1
+    GAUSSIAN_FOLDING = 0
 
 
 # NOTE (yiakwy) : useful for multiple-die chiplet architecture :
@@ -85,6 +91,400 @@ def _compute_pid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M):
         pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
         pid_n = (tile_id % num_pid_in_group) // group_size_m
     return pid_m, pid_n
+
+
+@triton.jit
+def _symm_moun_mat_compute(
+    pid_m_pair,
+    pid_m,
+    pid_n,
+    acc,
+    acc_pair,
+    xq_ptr,
+    wq_ptr,
+    xs_lhs_ptr,
+    xs_rhs_ptr,
+    o_ptr,
+    M,
+    K,
+    stride_xq_m,
+    stride_xq_k,
+    stride_wq_n,
+    stride_wq_k,
+    stride_xs_m,
+    stride_xs_k,
+    stride_ws_n,
+    stride_ws_k,
+    stride_o_m,
+    stride_o_n,
+    offs_k,
+    start_ssteps,
+    num_ssteps,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    SCALE_BLOCK_SIZE_N,
+    SCALE_BLOCK_SIZE_K,
+    SPLIT_K,
+):
+    offs_xq_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_xq_pair_m = (pid_m_pair * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+
+    if BLOCK_SIZE_M != BLOCK_SIZE_N or pid_m != pid_n:
+        offs_wq_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % M
+    else:
+        offs_wq_n = offs_xq_m
+
+    xq_block_ptr = xq_ptr + (
+        offs_xq_m[:, None] * stride_xq_m + offs_k[None, :] * stride_xq_k
+    )
+    xq_pair_block_ptr = xq_ptr + (
+        offs_xq_pair_m[:, None] * stride_xq_m + offs_k[None, :] * stride_xq_k
+    )
+
+    wq_block_ptr = wq_ptr + (
+        offs_wq_n[:, None] * stride_wq_n + offs_k[None, :] * stride_wq_k
+    )
+
+    xs_block_ptr = (
+        xs_lhs_ptr
+        + offs_xq_m * stride_xs_m
+        + start_ssteps * BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+    )
+    xs_pair_block_ptr = (
+        xs_lhs_ptr
+        + offs_xq_pair_m * stride_xs_m
+        + start_ssteps * BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+    )
+
+    offs_ws_n = offs_wq_n // SCALE_BLOCK_SIZE_N
+    ws_block_ptr = (
+        xs_rhs_ptr
+        + offs_ws_n * stride_ws_n
+        + start_ssteps * BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+    )
+
+    xq = tl.load(
+        xq_block_ptr,
+        mask=offs_k[None, :] < K,
+        other=0.0,
+    )
+
+    xq_pair = xq
+    if pid_m_pair >= pid_n:
+        xq_pair = tl.load(
+            xq_pair_block_ptr,
+            mask=offs_k[None, :] < K,
+            other=0.0,
+        )
+
+    wq = tl.load(
+        wq_block_ptr,
+        mask=offs_k[None, :] < K,
+        other=0.0,
+    )
+
+    xs = tl.load(xs_block_ptr)
+
+    xs_pair = xs
+    if pid_n <= pid_m_pair:
+        xs_pair = tl.load(xs_pair_block_ptr)
+
+    ws = tl.load(ws_block_ptr)
+
+    xq_next = xq
+    wq_next = wq
+
+    xs_next = xs
+    ws_next = ws
+
+    xq_pair_next = xq_pair
+    xs_pair_next = xs_pair
+
+    last_ssteps = start_ssteps * BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+    end_ssteps = start_ssteps + num_ssteps
+    for k in tl.range(start_ssteps, end_ssteps):
+        xq_k_step = BLOCK_SIZE_K * stride_xq_k
+        wq_k_step = BLOCK_SIZE_K * stride_wq_k
+
+        cur_ssteps = (k + 1) * BLOCK_SIZE_K // SCALE_BLOCK_SIZE_K
+        if k + 1 < end_ssteps:
+            xq_next = tl.load(
+                xq_block_ptr + xq_k_step,
+                mask=offs_k[None, :] < K - (k + 1) * (BLOCK_SIZE_K),
+                other=0.0,
+            )
+
+            wq_next = tl.load(
+                wq_block_ptr + wq_k_step,
+                mask=offs_k[None, :] < K - (k + 1) * (BLOCK_SIZE_K),
+                other=0.0,
+            )
+
+            if cur_ssteps > last_ssteps:
+                xs_next = tl.load(xs_block_ptr + stride_xs_k)
+                ws_next = tl.load(ws_block_ptr + stride_ws_k)
+
+        acc += tl.dot(xq, wq.trans(1, 0), input_precision="ieee") * (
+            xs[:, None] * ws[None, :]
+        )
+
+        if pid_m_pair >= pid_n:
+            if k + 1 < end_ssteps:
+                xq_pair_next = tl.load(
+                    xq_pair_block_ptr + xq_k_step,
+                    mask=offs_k[None, :] < K - (k + 1) * (BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                xs_pair_next = tl.load(xs_pair_block_ptr + stride_xs_k)
+
+            acc_pair += tl.dot(xq_pair, wq.trans(1, 0), input_precision="ieee") * (
+                xs_pair[:, None] * ws[None, :]
+            )
+
+        xq_block_ptr += xq_k_step
+        wq_block_ptr += wq_k_step
+
+        if cur_ssteps > last_ssteps:
+            xs_block_ptr += stride_xs_k
+            ws_block_ptr += stride_ws_k
+
+        if k + 1 < end_ssteps:
+            xq = xq_next
+            wq = wq_next
+
+            if cur_ssteps > last_ssteps:
+                xs = xs_next
+                ws = ws_next
+
+        if pid_m_pair >= pid_n:
+            xq_pair_block_ptr += xq_k_step
+
+            if cur_ssteps > last_ssteps:
+                xs_pair_block_ptr += stride_xs_k
+
+            if k + 1 < end_ssteps:
+                xq_pair = xq_pair_next
+
+                if cur_ssteps > last_ssteps:
+                    xs_pair = xs_pair_next
+
+        last_ssteps = cur_ssteps
+
+    if acc.dtype != o_ptr.type.element_ty:
+        _acc = acc.to(o_ptr.type.element_ty)
+    else:
+        _acc = acc
+    o_block_ptr = (
+        o_ptr + offs_xq_m[:, None] * stride_o_m + offs_wq_n[None, :] * stride_o_n
+    )
+    o_mask = (offs_xq_m[:, None] < M) & (offs_wq_n[None, :] < M)
+    if SPLIT_K == 1:
+        tl.store(o_block_ptr, _acc, mask=o_mask)
+    else:
+        tl.atomic_add(o_block_ptr, _acc, mask=o_mask)
+
+    if pid_n < pid_m:
+        _acc = tl.trans(_acc, 1, 0)
+        o_block_ptr = (
+            o_ptr + offs_wq_n[:, None] * stride_o_m + offs_xq_m[None, :] * stride_o_n
+        )
+        o_mask = (offs_wq_n[:, None] < M) & (offs_xq_m[None, :] < M)
+        if SPLIT_K == 1:
+            tl.store(o_block_ptr, _acc, mask=o_mask)
+        else:
+            tl.atomic_add(o_block_ptr, _acc, mask=o_mask)
+
+    if pid_n <= pid_m_pair:
+        if acc_pair.dtype != o_ptr.type.element_ty:
+            _acc = acc_pair.to(o_ptr.type.element_ty)
+        else:
+            _acc = acc_pair
+        o_pair_block_ptr = (
+            o_ptr
+            + offs_xq_pair_m[:, None] * stride_o_m
+            + offs_wq_n[None, :] * stride_o_n
+        )
+        o_mask_pair = (offs_xq_pair_m[:, None] < M) & (offs_wq_n[None, :] < M)
+        if SPLIT_K == 1:
+            tl.store(o_pair_block_ptr, _acc, mask=o_mask_pair)
+        else:
+            tl.atomic_add(o_pair_block_ptr, _acc, mask=o_mask_pair)
+
+        if pid_n < pid_m_pair:
+            _acc = tl.trans(_acc, 1, 0)
+            o_pair_block_ptr = (
+                o_ptr
+                + offs_wq_n[:, None] * stride_o_m
+                + offs_xq_pair_m[None, :] * stride_o_n
+            )
+            o_mask_pair = (offs_wq_n[:, None] < M) & (offs_xq_pair_m[None, :] < M)
+            if SPLIT_K == 1:
+                tl.store(o_pair_block_ptr, _acc, mask=o_mask_pair)
+            else:
+                tl.atomic_add(o_pair_block_ptr, _acc, mask=o_mask_pair)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+            },
+            num_stages=2,
+            num_warps=8,
+            maxnreg=384,
+        ),
+    ],
+    key=("M", "K"),
+    use_cuda_graph=True,
+)
+@triton.heuristics(
+    {
+        "NUM_PID_M": lambda args: triton.cdiv(args["M"] // 2, args["BLOCK_SIZE_M"]),
+        "SPLIT_K": lambda args: args.get("SPLIT_K", 1),
+    }
+)
+@triton.jit
+def paired_symm_moun_mat_fp8_block_scaled_tuned_kernel(
+    xq_ptr,
+    wq_ptr,
+    o_ptr,
+    M,
+    K,
+    stride_xq_m,
+    stride_xq_k,
+    stride_o_m,
+    stride_o_n,
+    xs_lhs_ptr,
+    xs_rhs_ptr,
+    stride_xs_lhs_m,
+    stride_xs_lhs_k,
+    stride_xs_rhs_n,
+    stride_xs_rhs_k,
+    SCALE_BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    NUM_CUs: tl.constexpr,
+    NUM_PID_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    M_EVEN: tl.constexpr,
+):
+    pid_k = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    num_pid_m = NUM_PID_M
+
+    if M_EVEN:
+        FULL_BLOCKS = num_pid_m * 2 - 1
+    else:
+        FULL_BLOCKS = num_pid_m * 2
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    num_ssteps = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
+
+    start_ssteps = pid_k * num_ssteps
+    offs_k += start_ssteps * BLOCK_SIZE_K
+
+    acc_dtype = tl.float32
+
+    pid_m_pair = FULL_BLOCKS - pid_m
+    for pid_n in tl.range(0, pid_m_pair + 1):
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        acc_pair = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+        _symm_moun_mat_compute(
+            pid_m,
+            pid_m_pair,
+            pid_n,
+            acc,
+            acc_pair,
+            xq_ptr,
+            wq_ptr,
+            xs_lhs_ptr,
+            xs_rhs_ptr,
+            o_ptr,
+            M,
+            K,
+            stride_xq_m,
+            stride_xq_k,
+            stride_xq_m,
+            stride_xq_k,
+            stride_xs_lhs_m,
+            stride_xs_lhs_k,
+            stride_xs_rhs_n,
+            stride_xs_rhs_k,
+            stride_o_m,
+            stride_o_n,
+            offs_k,
+            start_ssteps,
+            num_ssteps,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_BLOCK_SIZE_N,
+            SCALE_BLOCK_SIZE_K,
+            SPLIT_K,
+        )
+
+
+def thunder_moun_gemm(
+    xq_lhs: torch.Tensor,
+    xq_rhs: torch.Tensor,
+    xs_0: torch.Tensor,
+    xs_1: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    online_quant: bool = False,
+    SPLIT_K: int = 1,
+    use_tvm_ffi: Optional[bool] = None,
+):
+    use_ffi = USE_TVM_FFI if use_tvm_ffi is None else use_tvm_ffi
+    if use_ffi:
+        raise NotImplementedError(
+            "Triton 3.5 thunder_moun_gemm TVM-FFI launcher is not wired yet. "
+            "Use native first, then add the launcher after native is validated."
+        )
+
+    M, K = xq_lhs.shape
+    if out is None:
+        out = torch.zeros((M, M), device=xq_lhs.device, dtype=torch.float16)
+
+    grid = lambda META: (SPLIT_K, triton.cdiv(M // 2, META["BLOCK_SIZE_M"]), 1)
+    kernel = paired_symm_moun_mat_fp8_block_scaled_tuned_kernel
+
+    kernel[grid](
+        xq_lhs,
+        xq_rhs,
+        out,
+        M,
+        K,
+        xq_lhs.stride(0),
+        xq_lhs.stride(1),
+        out.stride(0),
+        out.stride(1),
+        xs_0,
+        xs_1,
+        xs_0.stride(0),
+        xs_0.stride(1),
+        xs_1.stride(0),
+        xs_1.stride(1),
+        SCALE_BLOCK_SIZE_K=128,
+        SCALE_BLOCK_SIZE_N=128,
+        NUM_XCDS=NUM_XCDS,
+        NUM_CUs=NUM_CUs,
+        SPLIT_K=SPLIT_K,
+        M_EVEN=M % 2 == 0,
+    )
+
+    return out
 
 
 # Ref kernels are adpated from modded-gpt
