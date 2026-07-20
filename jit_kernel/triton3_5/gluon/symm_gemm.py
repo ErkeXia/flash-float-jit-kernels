@@ -126,6 +126,38 @@ if version.parse(triton.__version__) < version.parse("3.6"):
     # NOTE (yiakwy) : FIX newer triton API
     setattr(gl, 'swizzle2d', swizzle2d)
     setattr(gl, 'xcd_swizzle', xcd_swizzle)
+
+else:
+    # for hopper tma triton 3.6+
+
+    @gluon.jit
+    def allocate_mbarrier(batch: gl.constexpr = None, two_ctas: gl.constexpr = False):
+        """
+        Helper function to allocate an mbarrier
+
+        Args:
+            two_ctas (bool): Whether the barrier should synchronize every other CTA
+        """
+        num_ctas: gl.constexpr = gl.num_ctas()
+        num_elems: gl.constexpr = num_ctas if not two_ctas else num_ctas // 2
+
+        gl.static_assert(batch is None or isinstance(batch.value, int))
+
+        bar = gl.allocate_shared_memory(gl.int64, [batch, num_elems], mbarrier.MBarrierLayout())
+        return bar
+
+    # NOTE (yiakwy) : hopper does not implement allocate_mbarrier method
+    if not hasattr(mbarrier, 'allocate_mbarrier'):
+        setattr(mbarrier, 'allocate_mbarrier', allocate_mbarrier)
+
+    # NOTE (yiakwy) : see https://github.com/triton-lang/triton/pull/10083
+    @gl._core.builtin
+    def async_load(tensor_desc, coord, barrier, result, pred=True, multicast=False, _semantic=None):
+        # NOTE (yiakwy) : TMA multicast is not supported in triton 3.6 release
+        return tma.async_copy_global_to_shared(tensor_desc, coord, barrier, result, pred=pred, _semantic=_semantic)
+
+    if not hasattr(tma, 'acync_load'):
+        setattr(tma, 'async_load', async_load)
     
 
 # Adpated from gemm swizzle by @byronxu99 for reference
@@ -259,7 +291,7 @@ def XXT_kernel(
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         group_id = pid_local // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = gl.min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + ((pid_local % num_pid_in_group) % group_size_m)
         pid_n = (pid_local % num_pid_in_group) // group_size_m
 
@@ -272,8 +304,14 @@ def XXT_kernel(
     # TODO (yiakwy) : updated to new scheduler for triangular matrix
     skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
     skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+
+    gl.assume(skip_block_above_diag == True)
+
     if skip_block_below_diag or skip_block_above_diag:
         return
+
+    m_idx = m_idx + batch_idx * M
+    n_idx = n_idx + batch_idx * M
 
     # NOTE (yiakwy) : NV TMA does not need to use gl.DistributedLinearLayout to compute per-thread offset to load data into registers
 
@@ -283,31 +321,17 @@ def XXT_kernel(
     tile_a = gl.allocate_shared_memory(dtype, [STAGES] + A_desc.block_type.shape, A_desc.layout)
 
     # TODO (yiakwy) : support BLOCK_SIZE_M != BLOCK_SIZE_N
-    gl.assume(BLOCK_SIZE_M == BLOCK_SIZE_N, "only support symmetric blocking to reduce shared memory usage")
+    gl.assume(BLOCK_SIZE_M == BLOCK_SIZE_N) #  "only support symmetric blocking to reduce shared memory usage"
 
     wgmma_layout: gl.constexpr = pick_wgmma_layout(dtype, BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps)
 
     acc_dtype =gl.float32
     acc = warpgroup_mma_init(gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wgmma_layout))
-    
-    A_ptr = A_desc.get_ptr()
-    C_ptr = C_desc.get_ptr()
-
-    # NOTE (yiakwy) : add batched gemm support
-    if A_desc.ndim == 3:
-        A_ptr = A_ptr + batch_idx * A_desc.stride(0)
-    if C_desc.ndim == 3:
-        C_ptr = C_ptr + batch_idx * C_desc.stride(0)
-    
-    # offs_m = (m_idx + gl.arange(BLOCK_SIZE_M)) % M
-    # offs_n = (n_idx + gl.arange(BLOCK_SIZE_N)) % M
-
-    # offs_k = gl.arange(BLOCK_SIZE_K)
-        
-    off_m = m_idx * BLOCK_SIZE_M
+           
+    off_m = m_idx
 
     # mma_barrier_count : gl.constexpr = 4 # COMPUTE_WARPS
-    # load_empty_bars = mbarrier.allocate_mbarrier(batch=STAGES)
+    # load_empty_bars = allocate_mbarrier(batch=STAGES)
     
     # TODO (yiakwy) : add support of WASP
     load_ready_bars = mbarrier.allocate_mbarrier(batch=STAGES)
@@ -327,42 +351,42 @@ def XXT_kernel(
 
             mbarrier.expect(load_ready_bars.index(write_stage), A_desc.block_type.nbytes)
 
+            # NOTE (yiakwy) : triton 3.6 does not suppor multicast, please updated to triton 3.7 (after Apri 2026) for the performance boost
             tma.async_load(A_desc, [off_m, off_k], load_ready_bars.index(write_stage), a, multicast=True)
+            # async_copy_global_to_shared(tensor_desc, coord, barrier, result, pred=True, _semantic=None):
 
             write_stage = (write_stage + 1) % STAGES
         
     tma_phase = 0
 
     # 2. Main loop
+    ssteps = gl.cdiv(K, BLOCK_SIZE_K)
     for k in range(gl.cdiv(K, BLOCK_SIZE_K)):
-        k_start = k * BLOCK_SIZE_K
-        k_remaining = K - k_start
+        off_k = k * BLOCK_SIZE_K
         
         mbarrier.wait(load_ready_bars.index(read_stage), phase=tma_phase)
 
         # TODO (yiakwy) : add wgmma
         a = tile_a.index(read_stage)
-        at = gl.transpose(a)
+        at = a.permute((1, 0)) # gl.transpose(a)
 
         acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc, ))
         acc = warpgroup_mma(a, at, acc, is_async=True)
 
         # issue next load
-        next_k = k + STAGES - 1
+        next_k = (k + STAGES) * BLOCK_SIZE_K 
         if next_k < K:
             _a = tile_a.index(write_stage)
 
             mbarrier.expect(load_ready_bars.index(write_stage), A_desc.block_type.nbytes)
 
-            tma.async_load(A_desc, [off_m, off_k], load_ready_bars.index(write_stage), _a, multicast=True)
+            tma.async_load(A_desc, [off_m, next_k], load_ready_bars.index(write_stage), _a, multicast=True)
 
             write_stage = (write_stage + 1) % STAGES
         
         read_stage = (read_stage + 1) % STAGES
         if read_stage == 0:
             tma_phase ^= 1
-            pass
-
     
     # 3. Epilogue
     acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc, ))
@@ -372,24 +396,12 @@ def XXT_kernel(
     fence_async_shared()
 
     # NOTE (yiakwy) : store & transpose store
-    # offs_cm = m_idx + gl.arange(BLOCK_SIZE_M)
-    # offs_cn = n_idx + gl.arange(BLOCK_SIZE_N)
-    
-    # c_ptrs = C_ptr + (offs_cm[:, None] * C_desc.stride(-2) + 
-    #                     offs_cn[None, :] * C_desc.stride(-1))
-    # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-    # gl.store(c_ptrs, c, mask=c_mask)
-
-    off_n = n_idx * BLOCK_SIZE_N
+    off_n = n_idx
     tma.async_copy_shared_to_global(C_desc, [off_m, off_n], c)
-    
-    # c_ptrs_t = C_ptr + (offs_cn[:, None] * C_desc.stride(-2) + 
-    #                     offs_cm[None, :] * C_desc.stride(-1))
-    # c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-    # gl.store(c_ptrs_t, gl.transpose(c), mask=c_mask_t)
-    tma.async_copy_shared_to_global(C_desc, [off_n, off_m], gl.transpose(c))
-    tma.store_wait(pendings=0)
 
+    ct = c.permute((1,0)) # gl.transpose(c)
+    tma.async_copy_shared_to_global(C_desc, [off_n, off_m], ct)
+    tma.store_wait(pendings=0)
 
 
 class GluonXXT:
@@ -400,7 +412,7 @@ class GluonXXT:
         BLOCK_SIZE_K: int = 64,
         GROUP_SIZE_M: int = 8,
         STAGES: int = 2,
-        LOWER_UPPER: int = 1,
+        LOWER_UPPER: int = 1, # NOTE (yiakwy) : 1 skip block above diaglogue; 0 skip block below diaglogue
     ):
         self.BLOCK_SIZE_M = BLOCK_SIZE_M
         self.BLOCK_SIZE_N = BLOCK_SIZE_N
@@ -416,7 +428,15 @@ class GluonXXT:
     
     # TODO (yiakwy) : cache TVM-FFI compiled result
     
-    def __call__(self, A: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+    def __call__(self, A: torch.Tensor, C: Optional[torch.Tensor] = None) -> torch.Tensor:
+        M, K = A.shape[-2:]
+
+        if C is None:
+            if A.ndim == 2:
+                C = torch.empty((M, M), device=A.device, dtype=A.dtype)
+            else:
+                C = torch.empty( A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
+
         a_layout = gl.NVMMASharedLayout.get_default_for(self.a_shape, gl.bfloat16)
         c_layout = gl.NVMMASharedLayout.get_default_for(self.c_shape, gl.bfloat16)
 
@@ -424,8 +444,8 @@ class GluonXXT:
         C_desc = TensorDescriptor.from_tensor(C, self.c_shape, c_layout)
         
         batch_size = A.size(0) if A.ndim == 3 else 1
-        input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-        output_batch_stride = C.stride(0) if C.ndim == 3 else 0
+        # input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+        # output_batch_stride = C.stride(0) if C.ndim == 3 else 0
 
         M, K = A.shape[-2:]
         
@@ -444,18 +464,16 @@ class GluonXXT:
             GROUP_SIZE_M=self.GROUP_SIZE_M,
             LOWER_UPPER=self.LOWER_UPPER,
             STAGES=self.STAGES,
-            num_warps=12 # 1 x producer, 2 x consumers
+            num_warps=8 # 8 for multi stages, 12 for 1 x producer wg, 2 x consumers wg
         )
         
         return C
     
 
 # Unified interface for XXT and XXL
-def compute_xxv_or_xxl(
+def symm_gemm(
     A: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    mode: str = 'xxv',
-    lower_upper: int = 1,
     use_gluon: bool = True
 ) -> torch.Tensor:
     M, K = A.shape[-2:]
@@ -464,19 +482,6 @@ def compute_xxv_or_xxl(
         if A.ndim == 2:
             out = torch.empty((M, M), device=A.device, dtype=A.dtype)
         else:
-            batch_size = A.size(0)
-            out = torch.empty((batch_size, M, M), device=A.device, dtype=A.dtype)
+            out = torch.empty( A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
     
-    if mode == 'xxv':
-        return XXT(A, out, use_gluon=use_gluon)
-    elif mode == 'xxl':
-        result = XXT(A, out, use_gluon=use_gluon)
-        if lower_upper == 0:
-            mask = torch.tril(torch.ones_like(result))
-            result = result * mask
-        elif lower_upper == 1:
-            mask = torch.triu(torch.ones_like(result))
-            result = result * mask
-        return result
-    else:
-        raise ValueError(f"Unsupported mode: {mode}")
+    raise NotImplementedError("symm_gemm is not implemented yet, please use XXT instead")
