@@ -1,33 +1,70 @@
+import inspect
+
 import triton
-
-import tvm_ffi
-
+import triton.language as tl
 from packaging import version
+
+
+def is_constexpr_param(param):
+    ann = param.annotation
+    if ann is inspect._empty:
+        return False
+    return (
+        ann is tl.constexpr
+        or getattr(ann, "__name__", "") == "constexpr"
+        or "constexpr" in str(ann)
+    )
+
+
+def cpp_host_type(name: str) -> str:
+    if "ptr" in name:
+        return "TensorView"
+    if "use_" in name or "is_" in name:
+        return "bool"
+    return "int32_t"
+
+
+def kernel_arg_type(name: str) -> str:
+    if "ptr" in name:
+        return "void*"
+    if "use_" in name or "is_" in name:
+        return "bool"
+    return "int32_t"
+
+
+def kernel_arg_assignment(name: str) -> str:
+    if "ptr" in name:
+        return f"kargs.{name} = {name}.data_ptr();\n"
+    return f"kargs.{name} = {name};\n"
+
 
 # Triton 3.4
 def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
     # Triton 3.5+
     if version.parse(triton.__version__) >= version.parse("3.5"):
-        raise Exception("TVM FFI Not Implemented for Triton 3.5+ due to the change of metadata structure, need to update the parsing logic accordingly.")
-    
-    arg_names = compiled_kernel.src.fn.arg_names
-    signature = compiled_kernel.src.fn.signature 
+        raise Exception(
+            "TVM FFI Not Implemented for Triton 3.5+ due to the change of metadata structure, need to update the parsing logic accordingly."
+        )
 
-    # cpp_params = ["int64_t cubin_ptr_addr"]   # FFI args list
+    if debug:
+        print(compiled_kernel.metadata)
+        print(compiled_kernel.asm["ptx"].split(".entry", 1)[1].split(")", 1)[0])
+
+    arg_names = compiled_kernel.src.fn.arg_names
+    signature = compiled_kernel.src.fn.signature
+
+    # TVM-FFI args list
     cpp_params = []
 
-    launch_args_def = []  # cuLaunchKernel pointer args list
-    launch_args = []  # cuLaunchKernel args list
+    # cuLaunchKernel arguemnt definition
+    launch_args_def = []
+    # cuLaunchKernel argsument assignment
+    launch_args = []
 
     constants = {}
     constants_set = set()
     for key, val in compiled_kernel.src.constants.items():
         name = arg_names[key[0]]
-
-        if "stride_" in name:
-            if debug:
-                print(f"{name} is not regarded as constant")
-            continue
 
         constants[name] = (key[0], val)
         constants_set.add(name)
@@ -37,24 +74,20 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
         print("constants : ", constants)
 
     for name, param in signature.parameters.items():
-        if name in constants_set:
+        # const param should not be added into cpp_params
+        if is_constexpr_param(param):
             continue
 
-        if "ptr" in name:
-            cpp_params.append(f"TensorView {name}")
-            launch_args_def.append(f"void* {name};\n")
-            launch_args.append(f"kargs.{name} = {name}.data_ptr();\n")
-        elif "use_" in name or "is_" in name:
-            cpp_params.append(f"bool {name}")
-            launch_args_def.append(f"bool {name};\n")
-            launch_args.append(f"kargs.{name} = {name};\n")
-        else:
-            cpp_params.append(f"int32_t {name}")
-            launch_args_def.append(f"int32_t {name};\n")
-            launch_args.append(f"kargs.{name} = {name};\n")
-            
+        cpp_params.append(f"{cpp_host_type(name)} {name}")
 
-    cpp_params_str = ", ".join(cpp_params + ["int32_t grid_x", "int32_t grid_y", "int32_t grid_z"])
+        # const in a compiled kernel should not be added into launch_args_def and launch_args
+        if name not in constants_set:
+            launch_args_def.append(f"{kernel_arg_type(name)} {name};\n")
+            launch_args.append(kernel_arg_assignment(name))
+
+    cpp_params_str = ", ".join(
+        cpp_params + ["int32_t grid_x", "int32_t grid_y", "int32_t grid_z"]
+    )
 
     launch_args_def_str = "".join(launch_args_def)
     launch_args_str = "".join(launch_args)
@@ -66,10 +99,9 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 
     META = compiled_kernel.metadata
 
-    num_warps = META.num_warps # compiled_kernel.num_warps
-    shared_mem_size = 24 * 1024 # META.shared
+    num_warps = META.num_warps  # compiled_kernel.num_warps
+    shared_mem_size = META.shared
 
-    arch = META.target.arch
     WARP_SIZE = META.target.warp_size
 
     source = f"""
@@ -80,15 +112,48 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 
-#define USE_TVM_FFI_LAUNCH_CONVENTION 0
+
+// NOTE (yiakwy) : for CUresult
+#define CHECK_CUDA_DRIVER_ERROR(call) \
+    do {{ \
+        CUresult err = call; \
+        if (err != CUDA_SUCCESS) {{ \
+            const char *err_name, *err_str; \
+            cuGetErrorName(err, &err_name); \
+            cuGetErrorString(err, &err_str); \
+            fprintf(stderr, "CUDA Driver Error at %s:%d: %s (%s)\\n", \
+                    __FILE__, __LINE__, err_name, err_str); \
+            fprintf(stderr, "Error code: %d\\n", err); \
+            cuCtxSynchronize(); \
+            throw std::runtime_error(std::string(err_name) + ", " + err_str); \
+        }} \
+    }} while(0)
+
+
+#define CHECK_CUDA_RUNTIME_ERROR(call) \
+    do {{ \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) {{ \
+            const char *err_name, *err_str; \
+            err_name = cudaGetErrorName(err); \
+            err_str = cudaGetErrorString(err); \
+            fprintf(stderr, "CUDA Runtime Error at %s:%d: %s (%s)\\n", \
+                    __FILE__, __LINE__, err_name, err_str); \
+            fprintf(stderr, "Error code: %d\\n", err); \
+            cudaDeviceSynchronize(); \
+            throw std::runtime_error(std::string(err_name) + ", " + err_str); \
+        }} \
+    }} while(0)
+
 
 TVM_FFI_EMBED_CUBIN(triton_cubin);
 
 namespace triton_loader {{
 using namespace tvm::ffi;
 
-// NOTE (yiakwy) : TVM's official method does not handle alignment issue, hence I use this method to escape alignment problem. 
+// NOTE (yiakwy) : TVM's official method does not handle alignment issue, hence I use this method to escape alignment problem.
 // We can also consider to modify TVM's official method to support alignment in the future if necessary.
 struct KernelArgs {{
     {launch_args_def_str};
@@ -101,59 +166,53 @@ void {kernel_name}_launcher({cpp_params_str}) {{
     KernelArgs kargs;
 
     {launch_args_str};
-    
-    cudaGetLastError();
+
+    DLDevice device = {arg_names[0]}.device();
 
     int shared_mem_bytes = {shared_mem_size};
-    cuDeviceGetAttribute(&shared_mem_bytes, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, 0);
-    
+    shared_mem_bytes = (shared_mem_bytes + 7) & ~7;
+
+    // NOTE (yiakwy) : use CUDA driver api
+    int max_shared_mem_bytes;
+    CUresult get_attr_result = cuDeviceGetAttribute(&max_shared_mem_bytes, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device.device_id);
+    CHECK_CUDA_DRIVER_ERROR(get_attr_result);
+
+    // NOTE (yiakwy) : Hopper allows to set maximum share memory >= 483232 bytes
+    if (shared_mem_bytes > max_shared_mem_bytes) {{
+        max_shared_mem_bytes = shared_mem_bytes;
+    }}
+
     CUfunction kernel = *(reinterpret_cast<CUfunction*>(&launcher));
-    cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (unsigned int)shared_mem_bytes);
-    
-    DLDevice device = {arg_names[0]}.device();
+
+    // NOTE (yiakwy) : use cuda runtime api
+    cudaError_t set_attr_result = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_bytes);
+    CHECK_CUDA_RUNTIME_ERROR(set_attr_result);
+
     cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 
     tvm::ffi::dim3 grid((unsigned int)grid_x, (unsigned int)grid_y, (unsigned int)grid_z);
     tvm::ffi::dim3 block({num_warps * WARP_SIZE}, 1, 1);
 
-#if USE_TVM_FFI_LAUNCH_CONVENTION
-    // Launch Kernel : old version does not support to pass shared_mem_bytes, so here is my workaround
-    TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(launcher.Launch(args, grid, block, stream, shared_mem_bytes));
-
-
-#else
     size_t kargs_size = sizeof(KernelArgs);
     void* config[] = {{
         CU_LAUNCH_PARAM_BUFFER_POINTER, &kargs,
         CU_LAUNCH_PARAM_BUFFER_SIZE,    &kargs_size,
         CU_LAUNCH_PARAM_END
-    }};  
+    }};
 
-    // see https://github.com/apache/tvm-ffi/blob/d73a26783488430986fd855ae67ff7a9fb016413/include/tvm/ffi/extra/cuda/internal/unified_api.h#L115
-    /*  
-    TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(static_cast<::tvm::ffi::cuda_api::ResultType>(
-        cuLaunchKernel(kernel, 
-          grid.x, grid.y, grid.z, 
-          block.x, block.y, block.z, 
-          (unsigned int)shared_mem_bytes, stream, nullptr, config);
-    ));
-    */
-
-    CUresult result = cuLaunchKernel(kernel, 
-          grid.x, grid.y, grid.z, 
-          block.x, block.y, block.z, 
+    CUresult result = cuLaunchKernel(
+          kernel,
+          grid.x, grid.y, grid.z,
+          block.x, block.y, block.z,
           (unsigned int)shared_mem_bytes, stream, nullptr, config);
 
     if (result != CUDA_SUCCESS) {{
-        // TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(static_cast<::tvm::ffi::cuda_api::ResultType>(result));
+        CHECK_CUDA_DRIVER_ERROR(result);
     }}
-
-    // cudaDeviceSynchronize();
-#endif
 }}
 
 }} // namespace triton_loader
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({kernel_name}, triton_loader::{kernel_name}_launcher);
 """
-    return source, constants 
+    return source, constants
