@@ -1,6 +1,7 @@
-import torch, triton
-import jit_kernel.triton3_4.symm_gemm as s
+import torch
+import triton
 
+import jit_kernel.triton3_4.symm_gemm as s
 
 SEED = 42
 
@@ -25,24 +26,38 @@ def test(m=2048):
 
     out = torch.empty((m, m), dtype=torch.float16, device="cuda")
 
-    sentinel = -1234.0
+    sentinel = float("NaN")
 
     # first call: populate TVM-FFI cache
     print("first call : ...")
     out.fill_(sentinel)
+    torch.cuda.synchronize()
+
     s.thunder_moun_gemm(x_fp8, x_fp8, xs_0, xs_1, out=out)
     torch.cuda.synchronize()
-    print("first sentinel remaining:", (out == sentinel).sum().item())
+    remaining = (out == sentinel).sum().item()
+    print("[1st Write] sentinel remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[1st Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel"
+
+    sentinel = float("-1234")
 
     # second call: cached TVM-FFI path only
     print("second call : ...")
     out.fill_(sentinel)
+    torch.cuda.synchronize()
+
     s.thunder_moun_gemm(x_fp8, x_fp8, xs_0, xs_1, out=out)
     torch.cuda.synchronize()
     remaining = (out == sentinel).sum().item()
 
-    print("cached sentinel remaining:", remaining)
-    print("total elements:", out.numel())
+    print("[2rd Write], sentinel remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[2rd Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel"
 
 
 if __name__ == "__main__":
