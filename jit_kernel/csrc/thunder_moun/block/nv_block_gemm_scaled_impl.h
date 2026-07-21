@@ -9,67 +9,40 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 namespace cg = cooperative_groups;
 
+#include "../arch/tma/tma_copy.h"
+#include "../arch/tma/tma_barrier.h"
+#include "../arch/cluster/cluster.h"
+
+#include "../arch/warpgroup/reg_allocator.h"
+
 // TODO (yiakwy) : refactor flashFloat FragView with Shape and Layout component with support of device side Flash Float datatype
 
 #include "../tensor/tensor_view_ref.h"
 #include "../fragment/nv_frag_gemm_scaled_impl.h"
+
 #include "block.h"
+#include "producer.h"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
 
 #ifndef SWIZZLE_64B_STORE
-#define SWIZZLE_64B_STORE 0
+#define SWIZZLE_64B_STORE 1
 #endif
 
 namespace cg = cooperative_groups;
 
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
-#define USE_CLUSTER_MULTICAST 0
+#define USE_CLUSTER_MULTICAST 1
 
 #define USE_INPALCE_TRI_TRANSPOSE 1
-
-namespace nvgpu {
-namespace arch {
-
-enum class CacheHintSm90 : uint64_t {
-  EVICT_NORMAL = 0x1000000000000000,
-  EVICT_FIRST = 0x12F0000000000000,
-  EVICT_LAST = 0x14F0000000000000,
-};
-
-} // namespace arch
-} // namespace nvgpu
-
-
-__device__ bool bar_try_wait(uint32_t bar_ptr, int phase) {
-  uint32_t success;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1; \n\t"
-      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2; \n\t"
-      "selp.b32 %0, 1, 0, P1; \n\t"
-      "}"
-      : "=r"(success)
-      : "r"(bar_ptr), "r"(phase));
-  return success;
-}
-
 
 namespace xpu {
 
 template <int BM, int BN, int BK, int STAGES, int GROUP_SIZE_M, int CLUSTER_SIZE_M>
 struct HopperPersistentSplitKPipeline {
-
-    // NOTE (yiakwy) : use cluster.map_shared_rank api to resolve the shared memory address from block-level view to cluster-level view.
-    static __device__ inline uint32_t resolve_noc_cluster_smem(void* local_ptr, int target_block_rank) {
-        uint32_t local_smem_addr = __cvta_generic_to_shared(local_ptr);
-        uint32_t cluster_smem_addr;
-        asm("mapa.shared.u32 %0, %1, %2;\n" : "=r"(cluster_smem_addr) : "r"(local_smem_addr), "r"(target_block_rank));
-        return cluster_smem_addr;
-    }
 
     // sm90+
     static __device__ inline void run_persistent(
@@ -93,16 +66,20 @@ struct HopperPersistentSplitKPipeline {
         using AccDtype = fp32_t;
         using OutDtype = half;
 
-
         const int tid = threadIdx.x;
         // const int lane_id = threadIdx.x % WARP_SIZE;
         // const int warp_id = threadIdx.x / WARP_SIZE;
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
-        asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(cluster_rank) : );
+        cluster_rank = nvgpu::arch::cluster_ctarank();
+
+        auto cluster = cooperative_groups::this_cluster();
+        auto clusterDim = cluster.dim_blocks();
+
+        const int cluster_group_m_rank = cluster_rank / clusterDim.x;
 #else
-         uint32_t cluster_rank = 0;
+        uint32_t cluster_rank = 0;
 #endif
 
         // prepare
@@ -128,35 +105,35 @@ struct HopperPersistentSplitKPipeline {
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
 
+        __shared__ __align__(128) OutDtype *dst[8];
+
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int s = 0; s < STAGES; ++s) {
                 uint32_t s_bar_ptr = __cvta_generic_to_shared(&barriers[s]);
-
-#if USE_CLUSTER_MULTICAST
-                asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" :: "r"(s_bar_ptr), "r"(CLUSTER_SIZE_M));
-#else
-                asm volatile("mbarrier.init.shared.b64 [%0], 1;\n" :: "r"(s_bar_ptr));
-#endif
+                nvgpu::arch::tma_init_barrier<USE_CLUSTER_MULTICAST>(&barriers[s], 1);
             }
         }
-
-        // NOTE (yiakwy) : ensure fences visible to all threads
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        nvgpu::arch::tma_store_fence();
         __syncthreads();
 
         uint64_t cache_hint_lhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_NORMAL);
-        uint64_t cache_hint_rhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_LAST);
-#if USE_CLUSTER_MULTICAST
-        asm volatile("barrier.cluster.arrive;\n" : :);
-        asm volatile("barrier.cluster.wait;\n" : :);
-
-        uint16_t cluster_mask = (1 << CLUSTER_SIZE_M) - 1;
-#endif
+        uint64_t cache_hint_rhs = static_cast<uint64_t>(nvgpu::arch::CacheHintSm90::EVICT_NORMAL);
 
         int split_k_id = blockIdx.x;
         int split_k = gridDim.x;
 
+#if USE_CLUSTER_MULTICAST
+        nvgpu::arch::cluster_sync();
+
+        uint16_t cluster_mask = 0;
+        const int num_splits = clusterDim.x; // split_k
+        const int _assumed_group_size_m = clusterDim.y; // GROUP_SIZE_M
+        for (int r =0; r < _assumed_group_size_m ; r++) {
+            int target_rank = split_k_id + r * num_splits;
+            cluster_mask |= (1 << target_rank);
+        }
+#endif
         const int k_tiles_total = (K + BK - 1) / BK;
 
         int k_tiles_per_slice = (k_tiles_total + split_k - 1) / split_k;
@@ -169,12 +146,6 @@ struct HopperPersistentSplitKPipeline {
             local_task_id = blockIdx.y;
         }
         __syncthreads();
-
-
-        // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-        //     printf("[Split#%d] [SM#%d] split_k = %d, k_tiles_total = %d, k_tiles_per_slice = %d, k_start=%d, k_end=%d\n", blockIdx.x, blockIdx.y, split_k, k_tiles_total, k_tiles_per_slice, k_start, k_end );
-        // }
-        // __syncthreads();
 
         while (local_task_id < total_symmetric_tiles) {
             accum.clear();
@@ -197,12 +168,11 @@ struct HopperPersistentSplitKPipeline {
             //     printf("[pre] [Split#%d] [SM#%d] block#(%d, %d) initiate TAM loading ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
             // }
 
-            // NOTE (yaikwy) : group swizzle after Down-Left Triangular Mapping for better L2 cache locality in TMA load
-            if constexpr (GROUP_SIZE_M > 1)
-            {
-                // Grouping for better L2 cache locality in TMA load
-                const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
+            // Grouping for better L2 cache locality in TMA load
+            const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
 
+            // NOTE (yaikwy) : group swizzle after Down-Left Triangular Mapping for better L2 cache locality in TMA load
+            if constexpr (GROUP_SIZE_M > 1) {
                 const uint32_t group_off_row = group_id * GROUP_SIZE_M;
                 const uint32_t group_size_m = min(num_blocks_m - group_off_row, static_cast<uint32_t>(GROUP_SIZE_M));
 
@@ -217,10 +187,6 @@ struct HopperPersistentSplitKPipeline {
                 const uint32_t in_group_idx = local_task_id - og_off;
 
                 const uint32_t test_col = in_group_idx / group_size_m;
-
-                // if (threadIdx.x == 0 && blockIdx.x == 0) {
-                //     printf("[sched] [Split#%d] [SM#%d] block#(%d, %d) group_size_m=%d, in_group_idx=%d, local_task_id=%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, group_size_m, in_group_idx, local_task_id);
-                // }
 
                 if (test_col < group_off_row) {
                     block_idx_m = group_off_row + (in_group_idx % group_size_m);
@@ -247,81 +213,30 @@ struct HopperPersistentSplitKPipeline {
             int read_stage = 0;
 
             // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
-            #pragma unroll
-            for (int i = 0; i < STAGES - 1; ++i) {
-                int current_k = k_start + i;
-                if (current_k < k_end) {
-
-                    // if (threadIdx.x == 0 && blockIdx.y == 0) {
-                    //     printf("[Prefetch] [Split#%d] [SM#%d] block#(%d, %d) Ramp up fill, stage#%d/%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, i, STAGES);
-                    // }
-
-                    // Commit the async copy for the first few stages, and then we will wait on them in the main loop
-                    // NOTE (yiakwy) : see https://github.com/NVIDIA/cutlass/blob/5f06f5fc1a072bbe4815fae7ae8470b876ed603a/include/cute/arch/copy_sm90_tma.hpp#L117 for the recommended way to commit async copy with TMA and mbarrier synchronization.
-                    // TODO (yiakwy) : use cache hint
-                    if (tid == 0) {
-                        uint32_t smem_x_addr = __cvta_generic_to_shared(&shmem_X[write_stage]);
-                        uint32_t smem_w_addr = __cvta_generic_to_shared(&shmem_W[write_stage]);
-
-                        uint32_t s_w_bar_ptr = __cvta_generic_to_shared(&barriers[write_stage]);
-
-                        // NOTE (yiakwy) : call mbarrier.arrive once
-                        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" :: "r"(s_w_bar_ptr), "r"(total_stage_bytes));
-
-                        // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
-                        //     printf("smem_x_addr : 0x%x (mod 128 = %d)\n", smem_x_addr, (int)(smem_x_addr % 128));
-                        //     printf("smem_w_addr : 0x%x (mod 128 = %d)\n", smem_w_addr, (int)(smem_w_addr % 128));
-                        // }
 
 #if  USE_CLUSTER_MULTICAST
-                        // The 2d tma instruction needs cluster mask to specify the destination of the multicast
-                        if (cluster_rank == 0)  {
-                            asm volatile(
-                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-                                " [%0], [%1, {%3, %4}], [%2], %5, %6;\n"
-                                :: "r"(smem_x_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_X)), "r"(s_w_bar_ptr),
-                                "r"(current_k * BK), "r"(block_idx_m * BM), "h"(cluster_mask), "l"(cache_hint_lhs)
-                                // : "memory"
-                            );
-
-
-                            asm volatile(
-                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-                                " [%0], [%1, {%3, %4}], [%2], %5, %6;\n"
-                                :: "r"(smem_w_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_W)), "r"(s_w_bar_ptr),
-                                "r"(current_k * BK), "r"(block_idx_n * BN), "h"(cluster_mask), "l"(cache_hint_rhs)
-                                // : "memory"
-                            );
-                        } // end of cluster_rank == 0
+            producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
+                tid, group_id, block_idx_m, block_idx_n,
+                k_start, k_end, total_stage_bytes,
+                tma_desc_X, tma_desc_W,
+                shmem_X, shmem_W, barriers,
+                cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
+                write_stage/*src & dst*/);
 #else
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%3, %4}], [%2], %5;\n"
-                            :
-                            : "r"(smem_x_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_X)), "r"(s_w_bar_ptr),
-                              "r"(current_k * BK), "r"(block_idx_m * BM), "l"(cache_hint_lhs)
-                            : "memory"
-                        );
-
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%3, %4}], [%2], %5;\n"
-                            :: "r"(smem_w_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_W)), "r"(s_w_bar_ptr),
-                            "r"(current_k * BK), "r"(block_idx_n * BN), "l"(cache_hint_rhs)
-                        );
+            producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
+                tid, group_id, block_idx_m, block_idx_n,
+                k_start, k_end, total_stage_bytes,
+                tma_desc_X, tma_desc_W,
+                shmem_X, shmem_W, barriers,
+                cache_hint_lhs, cache_hint_rhs,
+                write_stage/*src & dst*/);
 #endif
-                    } //  end of thread 0
-
-                    write_stage = (write_stage + 1) % STAGES;
-                }
-            }
 
             // if (threadIdx.x == 0 && blockIdx.x == 0) {
             //     printf("[Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
             // }
             // __syncthreads();
 
-            // NOTE (yiakwy) : prefetch all scale without TMA
             // NOTE (yiakwy) : rows of 1 or more BLOCKS share a scale
             const int stride_xs_m = K / SCLAE_BLOCK_SIZE_K;
             const int stride_ws_n = K / SCLAE_BLOCK_SIZE_K;
@@ -333,6 +248,9 @@ struct HopperPersistentSplitKPipeline {
             const int total_xs_elements = BM * k_tiles;
             const int total_ws_elements = k_tiles;
 
+            // NOTE (yiakwy) : prefetch all scale without TMA
+
+            // TODO (yiakwy) : remap shmem_XS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
             #pragma unroll 4
             for (int i = tid; i < total_xs_elements; i += threads_per_block) {
                 int s_row = i / k_tiles;
@@ -341,12 +259,11 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                // shmem_XS[s_row * k_tiles + s_col] = scale_X[g_row * stride_xs_m + g_col];
                 shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();
 
-            // TODO (yiakwy) : remap shmem_XS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
+           // TODO (yiakwy) : remap shmem_WS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
             #pragma unroll 4
             for (int i = tid; i < total_ws_elements; i += threads_per_block) {
                 int s_col = i;
@@ -354,51 +271,33 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_n;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                shmem_WS[s_col] = scale_X[g_row * stride_ws_n + g_col];
+                shmem_WS[s_col] = scale_W[g_row * stride_ws_n + g_col];
             }
             __syncthreads();
 
-            // TODO (yiakwy) : remap shmem_WS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
             int tma_phase = 0;
 
             // 2. main loop
             for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
                 uint32_t current_barrier = __cvta_generic_to_shared(&barriers[read_stage]);
 
-                // if (threadIdx.x == 0 && blockIdx.x == 1) {
+                // if (threadIdx.x == 0 && blockIdx.x == 0) {
                 //     printf("[MainLoop] [Split#%d] [SM#%d] block#(%d, %d) k_tile=%d, k_start=%d, k_end=%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, k_tile, k_start, k_end);
                 // }
 
                 if (threadIdx.x == 0) {
                     // NOTE (yiakwy) : wait parity switch from phase (1 at prfetch stage 0) to ^phase (0 when TMA finish stage 0 transactions)
-                    /*
-                    while (!bar_try_wait(current_barrier, tma_phases[read_stage])) {
-                        asm volatile("nanosleep.u32 64;\n");
-                    }
-                    */
-                    asm volatile(
-                        "{\n"
-                        ".reg .pred P;\n"
-                        "WAIT_LOOP:\n"
-                        "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
-                        "@P bra DONE;\n"
-                        "nanosleep.u32 64;\n"
-                        "bra WAIT_LOOP;\n"
-                        "DONE:\n"
-                        "}\n"
-                        :: "r"(current_barrier), "r"(tma_phase) : "memory"
-                    );
+                    nvgpu::arch::tma_wait(current_barrier, tma_phase);
                 }
                 __syncthreads();
 
-                // if (threadIdx.x == 0 && blockIdx.x == 0) {
+                // if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == k_end - 1) {
                 //     printf("[Split#%d/%d] [SM#%d] block#(%d, %d) k_tile=%d, inputs are ready.\n", blockIdx.x, gridDim.x, blockIdx.y, block_idx_m, block_idx_n, k_tile);
                 // }
                 // __syncthreads();
 
                 HopperWGMMAAccumulator<BM, BN, BK> local_step_accum;
                 local_step_accum.clear();
-                // asm volatile("" ::: "memory");
 
                 uint32_t active_smem_x = __cvta_generic_to_shared(&shmem_X[read_stage]);
                 uint32_t active_smem_w = __cvta_generic_to_shared(&shmem_W[read_stage]);
@@ -408,61 +307,28 @@ struct HopperPersistentSplitKPipeline {
 
                 int next_k = k_tile + (STAGES - 1);
                 if (next_k < k_end) {
-                    if (threadIdx.x == 0) {
-                        uint32_t smem_x_addr = __cvta_generic_to_shared(&shmem_X[write_stage]);
-                        uint32_t smem_w_addr = __cvta_generic_to_shared(&shmem_W[write_stage]);
-
-                        uint32_t s_w_bar_ptr = __cvta_generic_to_shared(&barriers[write_stage]);
-
-                        // if (threadIdx.x == 0 && blockIdx.y == 0) {
-                        //     printf("[Prefetch] [Split#%d] [SM#%d] block#(%d, %d) load k tile %d, stage#%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, next_k, write_stage);
-                        // }
-
-                        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n" :: "r"(s_w_bar_ptr), "r"(total_stage_bytes));
-
-                        // TODO (yiakwy) : add L2 cache locality .L2::cache_hint
-                        // TODO (yiakwy) : add multicast support .multicast::cluster
 
 #if  USE_CLUSTER_MULTICAST
-                        // The 2d tma instruction needs cluster mask to specify the destination of the multicast
-                         if (cluster_rank == 0) {
-                            asm volatile(
-                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-                                " [%0], [%1, {%3, %4}], [%2], %5, %6;\n"
-                                :: "r"(smem_x_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_X)), "r"(s_w_bar_ptr),
-                                "r"(next_k * BK), "r"(block_idx_m * BM), "h"(cluster_mask), "l"(cache_hint_lhs)
-                                : "memory"
-                            );
-
-                            asm volatile(
-                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-                                " [%0], [%1, {%3, %4}], [%2], %5, %6;\n"
-                                :: "r"(smem_w_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_W)), "r"(s_w_bar_ptr),
-                                "r"(next_k * BK), "r"(block_idx_n * BN), "h"(cluster_mask), "l"(cache_hint_rhs)
-                                : "memory"
-                            );
-                        } // end of cluster_rank == 0
+                    producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load_once(
+                        tid, group_id,
+                        next_k, block_idx_m, block_idx_n, total_stage_bytes,
+                        tma_desc_X, tma_desc_W,
+                        shmem_X, shmem_W, barriers,
+                        cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs, write_stage, tma_phase
+                    );
 #else
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%3, %4}], [%2], %5;\n"
-                            :: "r"(smem_x_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_X)), "r"(s_w_bar_ptr),
-                            "r"(next_k * BK), "r"(block_idx_m * BM), "l"(cache_hint_lhs)
-                        );
-
-                        asm volatile(
-                            "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%3, %4}], [%2], %5;\n"
-                            :: "r"(smem_w_addr), "l"(reinterpret_cast<uint64_t>(tma_desc_W)), "r"(s_w_bar_ptr),
-                            "r"(next_k * BK), "r"(block_idx_n * BN), "l"(cache_hint_rhs)
-                        );
+                    producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load_once(
+                        tid, group_id,
+                        next_k, block_idx_m, block_idx_n, total_stage_bytes,
+                        tma_desc_X, tma_desc_W,
+                        shmem_X, shmem_W, barriers,
+                        cache_hint_lhs, cache_hint_rhs, write_stage, tma_phase
+                    );
 #endif
-                    } // end of thread 0
-                    write_stage = (write_stage + 1) % STAGES;
-                }
+
+                } // next_k < k_end
 
                 HopperWGMMAExecutor::commit_and_wait();
-                // asm volatile("" ::: "memory");
 
                 local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 accum.add_(local_step_accum);
@@ -485,7 +351,6 @@ struct HopperPersistentSplitKPipeline {
             // }
             // __syncthreads();
 
-
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
             //     printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
@@ -497,9 +362,16 @@ struct HopperPersistentSplitKPipeline {
 
             if (split_k > 1) {
                 if (split_k_id == 0) {
-                    for (int r = 1; r < split_k; ++r) {
-                        OutDtype* dst_shmem_epilogue = cluster.map_shared_rank<OutDtype>(&shmem_epilogue[0], r);
+                    if (threadIdx.x == 0) {
+                        for (int r = 1; r < split_k; ++r) {
+                            OutDtype* dst_shmem_epilogue = cluster.map_shared_rank<OutDtype>(&shmem_epilogue[0], r);
+                            dst[r] = dst_shmem_epilogue;
+                        }
+                    }
+                    __syncthreads();
 
+                    for (int r = 1; r < split_k; ++r) {
+                        OutDtype* dst_shmem_epilogue = dst[r];
                         for (int idx = tid; idx < BM * BN; idx += threads_per_block) {
                             shmem_epilogue[idx] += dst_shmem_epilogue[idx];
                         }
@@ -524,9 +396,11 @@ struct HopperPersistentSplitKPipeline {
                     );
                 }
 
+#if (defined(USE_LINEAR_TO_TRIL_LAYOUT)) && USE_LINEAR_TO_TRIL_LAYOUT
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
-#ifdef USE_INPALCE_TRI_TRANSPOSE && USE_INPALCE_TRI_TRANSPOSE
+
+#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
                         asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                     }
@@ -535,15 +409,18 @@ struct HopperPersistentSplitKPipeline {
                     // NOTE (yiakwy) : inplace transpose
                     frag_view._transpose();
 #else
-                    // TODO (yiakwy) : outplace transpose
                     // NOTE (yiakwy) : outplace transpose
+                    // TODO (yiakwy) : outplace transpose
+#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+
 #endif // USE_INPALCE_TRI_TRANSPOSE
+
                     if (threadIdx.x == 0) {
 #if SWIZZLE_64B_STORE
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
 #else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
-#endif
+#endif // SWIZZLE_64B_STORE
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
 
 #if SWIZZLE_64B_STORE
@@ -575,12 +452,15 @@ struct HopperPersistentSplitKPipeline {
                             "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                             : "memory"
                         );
-#endif
+#endif // SWIZZLE_64B_STORE
                     }
 
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
                 } // block_idx_m > block_idx_n
+
+#endif // USE_LINEAR_TO_TRIL_LAYOUT
+
             } // split_id == 0
             cluster.sync();
 #else
@@ -616,6 +496,7 @@ struct HopperPersistentSplitKPipeline {
                 } // end of tranpose copy to upper right
             }
             __syncthreads();
+
 #endif // __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
 
             // fetch next task

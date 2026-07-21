@@ -29,10 +29,19 @@ cuda_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/symm_gemm.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc_impl.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy_impl.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_barrier.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_barrier.cu"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/block.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/producer.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/fragment.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/nv_frag_gemm_scaled_impl.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/array_ref.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/layout.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tuple.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tensor_view_ref.h"),
 ]
@@ -49,13 +58,15 @@ else:
     major = 0
 
 if major >= 9:
+    #         "--ptxas-options=-v",
     common_cuda_flags += [
+        "-O2",
         "-Xcompiler",
         "-fPIC",
         "-DENABLE_HOPPER=1",
         "-arch=compute_90a",
         "-code=sm_90a",
-        "--ptxas-options=-v",
+        "-I " + str(KERNEL_PATH / "csrc" / "thunder_moun"),
     ]
 
 
@@ -135,6 +146,9 @@ def symm_gemm_block_scaled(
     N = wq.shape[0]
 
     split_k = max(1, K // BLK_K)
+
+    # NOTE (yiakwy) : disable on chip split_k reduction via NoC for the moment
+    split_k = 1
 
     if out is None:
         out = torch.zeros((M, N), device=xq.device, dtype=torch.float16)

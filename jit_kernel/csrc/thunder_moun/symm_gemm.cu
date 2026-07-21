@@ -28,7 +28,10 @@ namespace cg = cooperative_groups;
 
 #define ENABLE_HOPPER 1
 
+// NOTE (yiakwy) : TVM FFI does not recognize __CUDA_ARCH__ macro for *.h files
+#ifndef __CUDA_ARCH__
 #define __CUDA_ARCH__ 900
+#endif
 
 #ifndef MIN
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -73,8 +76,9 @@ constexpr int K_STAGES = 4;
 
 constexpr int MAX_SPLIT_K = 8;
 
-constexpr int CLUSTER_SIZE_M = 4;
-constexpr int GROUP_SIZE_M = 4;
+constexpr int GROUP_SIZE_M = 16;
+// NOTE (yiakwy) : see our paper for details
+constexpr int CLUSTER_SIZE_M = 2; // GROUP_SIZE_M / 2;
 
 // 8 warps per block
 #ifndef WARP_SIZE
@@ -354,11 +358,16 @@ extern "C" int symm_gemm_fp8_block_scaled(
         split_k = 1;
     }
 
+    int cluster_size_m = MIN(4, CLUSTER_SIZE_M);
+    if (grid_mn % cluster_size_m != 0) {
+        cluster_size_m = 1;
+    }
+
+    int max_split_k = CEILDIV(MAX_SPLIT_K, cluster_size_m);
+    split_k = MIN(split_k, max_split_k);
+
     dim3 grid(split_k, grid_mn, 1);
     dim3 block(TOTAL_WARP_THREADS, 1, 1);
-
-    // TODO (yiakwy) : add TMA multicast along GROUP_SIZE_M
-    const int cluster_size_m = 1;  // CEILDIV(CLUSTER_SIZE_M, split_k);
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
     cudaLaunchConfig_t launch_config = {0};
