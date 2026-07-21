@@ -7,9 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
-
 from packaging import version
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 # NOTE (yiakwy) : useful for multiple-die chiplet architecture :
@@ -90,7 +89,6 @@ if version.parse(triton.__version__) < version.parse("3.6"):
         new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
         return new_pid
 
-
     @triton.jit
     def swizzle2d(pid, grid_m, grid_n, GROUP_M: tl.constexpr):
         width = GROUP_M * grid_n
@@ -102,11 +100,11 @@ if version.parse(triton.__version__) < version.parse("3.6"):
         pid_m = first_pid_m + (pid % group_size)
         pid_n = (pid % width) // (group_size)
         return pid_m, pid_n
-    
+
     # NOTE (yiakwy) : FIX newer triton API
-    setattr(tl, 'swizzle2d', swizzle2d)
-    setattr(tl, 'xcd_swizzle', xcd_swizzle)
-    
+    setattr(tl, "swizzle2d", swizzle2d)
+    setattr(tl, "xcd_swizzle", xcd_swizzle)
+
 
 # Adpated from gemm swizzle by @byronxu99 for reference
 @triton.jit
@@ -139,10 +137,16 @@ def _pid_to_block(
 # adapted from modded_nanogpt as ref
 @triton.jit
 def XXT_kernel(
-    A_ptr, C_ptr,
-    M, K,
-    a_stride_b, a_stride_r, a_stride_c,
-    c_stride_b, c_stride_r, c_stride_c,
+    A_ptr,
+    C_ptr,
+    M,
+    K,
+    a_stride_b,
+    a_stride_r,
+    a_stride_c,
+    c_stride_b,
+    c_stride_r,
+    c_stride_c,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -168,7 +172,7 @@ def XXT_kernel(
     offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
+
     # Load A blocks for C[m,n] = A[m,:] @ A[n,:].T
     # Load A[m, k] -> shape (BM, BK)
     a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
@@ -215,7 +219,9 @@ def XXT(A: torch.Tensor, out: Optional[torch.Tensor] = None):
 
     if out is None:
         if A.ndim == 3:
-            out = torch.zeros( A.shape[:-2] + (M, M), device=A.device, dtype=torch.float16)
+            out = torch.zeros(
+                A.shape[:-2] + (M, M), device=A.device, dtype=torch.float16
+            )
         else:
             out = torch.zeros((M, M), device=A.device, dtype=torch.float16)
 
@@ -261,10 +267,16 @@ def XXT(A: torch.Tensor, out: Optional[torch.Tensor] = None):
 # adapted from modded_nanogpt as ref
 @triton.jit
 def XTX_kernel(
-    A_ptr, C_ptr,
-    M, K,
-    a_stride_b, a_stride_r, a_stride_c,
-    c_stride_b, c_stride_r, c_stride_c,
+    A_ptr,
+    C_ptr,
+    M,
+    K,
+    a_stride_b,
+    a_stride_r,
+    a_stride_c,
+    c_stride_b,
+    c_stride_r,
+    c_stride_c,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -274,7 +286,7 @@ def XTX_kernel(
     """
     Compute C = A.T @ A where A is (M, K) and C is (K, K).
     This is the transpose variant of XXT for tall matrices.
-    
+
     The output matrix C is symmetric, so we compute upper triangle and mirror.
     We iterate over blocks of M (the reduction dimension after transpose).
     """
@@ -298,8 +310,12 @@ def XTX_kernel(
     # - A.T has shape (K, M), so A.T[k, m] = A[m, k]
     # - We load blocks from columns k_idx and n_idx of A (which are rows of A.T)
     # - We reduce over M (the shared dimension)
-    offs_k = (k_idx + tl.arange(0, BLOCK_SIZE_M)) % K  # Output row indices (columns of A)
-    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % K  # Output col indices (columns of A)
+    offs_k = (
+        k_idx + tl.arange(0, BLOCK_SIZE_M)
+    ) % K  # Output row indices (columns of A)
+    offs_n = (
+        n_idx + tl.arange(0, BLOCK_SIZE_N)
+    ) % K  # Output col indices (columns of A)
     offs_m = tl.arange(0, BLOCK_SIZE_K)  # Reduction dimension (rows of A)
 
     # Pointers for loading A[:, k_idx:k_idx+BLOCK] (transposed view is A.T[k_idx:, :])
@@ -344,14 +360,14 @@ def XTX_kernel(
 def XTX(A: torch.Tensor, out: Optional[torch.Tensor] = None):
     """
     Launch Triton kernel to compute C = A.T @ A
-    
+
     For tall matrices (M > K), this is more efficient than transposing
     and using XXT because the intermediate products are smaller (K x K vs M x M).
-    
+
     Args:
         A: Input tensor of shape (M, K) or (batch, M, K)
         out: Output tensor of shape (K, K) or (batch, K, K)
-    
+
     Returns:
         out: The same output tensor, filled with A.T @ A
     """
@@ -360,12 +376,18 @@ def XTX(A: torch.Tensor, out: Optional[torch.Tensor] = None):
 
     if out is None:
         if A.ndim == 3:
-            out = torch.zeros( A.shape[:-2] + (M, M), device=A.device, dtype=torch.float16)
+            out = torch.zeros(
+                A.shape[:-2] + (K, K), device=A.device, dtype=torch.float16
+            )
         else:
-            out = torch.zeros((M, M), device=A.device, dtype=torch.float16)
+            out = torch.zeros((K, K), device=A.device, dtype=torch.float16)
 
-    assert out.size(-2) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
-    assert out.size(-1) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+    assert (
+        out.size(-2) == K
+    ), f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+    assert (
+        out.size(-1) == K
+    ), f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
 
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
