@@ -430,7 +430,6 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
                             "r"(block_idx_n * BN), "r"(block_idx_m * BM)
-                            : "memory"
                         );
 
                         const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
@@ -441,7 +440,6 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
                                 "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
-                            : "memory"
                         );
 #else
                         asm volatile (
@@ -450,7 +448,6 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
                             "r"(block_idx_m * BN), "r"(block_idx_n * BM)
-                            : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
                     }
