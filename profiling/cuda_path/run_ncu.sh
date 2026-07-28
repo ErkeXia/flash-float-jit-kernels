@@ -39,7 +39,13 @@ fi
 
 ncu_cmd=("${NCU}")
 if [[ "${NCU_USE_SUDO}" == "1" ]]; then
-    ncu_cmd=(sudo -E "${NCU}")
+    sudo_env=("PATH=${PATH}" "HOME=${HOME}")
+    [[ -n "${VIRTUAL_ENV:-}" ]] && sudo_env+=("VIRTUAL_ENV=${VIRTUAL_ENV}")
+    [[ -n "${PYTHONPATH:-}" ]] && sudo_env+=("PYTHONPATH=${PYTHONPATH}")
+    [[ -n "${LD_LIBRARY_PATH:-}" ]] && sudo_env+=("LD_LIBRARY_PATH=${LD_LIBRARY_PATH}")
+    [[ -n "${CUDA_HOME:-}" ]] && sudo_env+=("CUDA_HOME=${CUDA_HOME}")
+    [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]] && sudo_env+=("TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR}")
+    ncu_cmd=(sudo env "${sudo_env[@]}" "${NCU}")
 fi
 
 echo "[ncu] prewarming JIT/cache outside Nsight Compute..."
