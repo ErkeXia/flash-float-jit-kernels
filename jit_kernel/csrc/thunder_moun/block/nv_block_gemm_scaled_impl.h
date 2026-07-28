@@ -303,11 +303,12 @@ struct HopperPersistentSplitKPipeline {
             int tma_phase = 0;
 
             // 2. main loop
-            FFJK_PROF_BEGIN(
-                ffjk::kProfilerEventMainLoop,
-                task_id,
-                ffjk::cuda_profiler_pack_u16(k_start, k_end));
             for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+                const int k_iter = k_tile - k_start;
+                const uint32_t k_payload =
+                    ffjk::cuda_profiler_pack_u16(k_tile, k_end);
+#endif
                 uint32_t current_barrier = __cvta_generic_to_shared(&barriers[read_stage]);
 
                 // if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -332,6 +333,11 @@ struct HopperPersistentSplitKPipeline {
                 uint32_t active_smem_w = __cvta_generic_to_shared(&shmem_W[read_stage]);
 
                 // NOTE (yiakwy) : hopper (SM90a) does not support mma_scaled instruction, sx, sw will be ignored in the current implementation, and the scaling will be applied in the epilogue.
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventWgmma,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 HopperWGMMAExecutor::mma_scaled(local_step_accum, active_smem_x, active_smem_w);
 
                 int next_k = k_tile + (STAGES - 1);
@@ -356,9 +362,35 @@ struct HopperPersistentSplitKPipeline {
                 } // next_k < k_end
 
                 HopperWGMMAExecutor::commit_and_wait();
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventWgmma,
+                    k_iter,
+                    task_id,
+                    k_payload);
 
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventScaling,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventScaling,
+                    k_iter,
+                    task_id,
+                    k_payload);
+
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventAccInPlaceAdd,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 accum.add_(local_step_accum);
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventAccInPlaceAdd,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 __syncwarp();
 
                 read_stage = (read_stage + 1) % STAGES;
@@ -366,10 +398,6 @@ struct HopperPersistentSplitKPipeline {
                     tma_phase ^= 1;
                 }
             }
-            FFJK_PROF_END(
-                ffjk::kProfilerEventMainLoop,
-                task_id,
-                ffjk::cuda_profiler_pack_u16(k_start, k_end));
 
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC

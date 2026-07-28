@@ -19,7 +19,9 @@ enum CudaProfilerEventId : uint32_t {
     kProfilerEventKernelLaunch = 1,
     kProfilerEventPrefetchData = 20,
     kProfilerEventScaleLoad = 21,
-    kProfilerEventMainLoop = 30,
+    kProfilerEventWgmma = 30,
+    kProfilerEventScaling = 31,
+    kProfilerEventAccInPlaceAdd = 32,
     kProfilerEventAccumToSmem = 40,
     kProfilerEventStoreLower = 42,
     kProfilerEventInPlaceTranspose = 43,
@@ -57,8 +59,8 @@ struct CudaProfilerLayout {
 };
 
 static constexpr uint32_t kCudaProfilerCtaSlots = 1;
-static constexpr uint32_t kCudaProfilerTaskSlots = 14;
-static constexpr uint32_t kCudaProfilerPerKSlots = 0;
+static constexpr uint32_t kCudaProfilerTaskSlots = 12;
+static constexpr uint32_t kCudaProfilerPerKSlots = 6;
 
 static constexpr int32_t kCudaProfilerInvalidSlot = -1;
 static constexpr uint32_t kCudaProfilerTagEventBits = 8;
@@ -71,16 +73,21 @@ static constexpr uint32_t kProfilerTaskSlotPrefetchDataBegin = 0;
 static constexpr uint32_t kProfilerTaskSlotPrefetchDataEnd = 1;
 static constexpr uint32_t kProfilerTaskSlotScaleLoadBegin = 2;
 static constexpr uint32_t kProfilerTaskSlotScaleLoadEnd = 3;
-static constexpr uint32_t kProfilerTaskSlotMainLoopBegin = 4;
-static constexpr uint32_t kProfilerTaskSlotMainLoopEnd = 5;
-static constexpr uint32_t kProfilerTaskSlotAccumToSmemBegin = 6;
-static constexpr uint32_t kProfilerTaskSlotAccumToSmemEnd = 7;
-static constexpr uint32_t kProfilerTaskSlotStoreLowerBegin = 8;
-static constexpr uint32_t kProfilerTaskSlotStoreLowerEnd = 9;
-static constexpr uint32_t kProfilerTaskSlotInPlaceTransposeBegin = 10;
-static constexpr uint32_t kProfilerTaskSlotInPlaceTransposeEnd = 11;
-static constexpr uint32_t kProfilerTaskSlotStoreMirrorBegin = 12;
-static constexpr uint32_t kProfilerTaskSlotStoreMirrorEnd = 13;
+static constexpr uint32_t kProfilerTaskSlotAccumToSmemBegin = 4;
+static constexpr uint32_t kProfilerTaskSlotAccumToSmemEnd = 5;
+static constexpr uint32_t kProfilerTaskSlotStoreLowerBegin = 6;
+static constexpr uint32_t kProfilerTaskSlotStoreLowerEnd = 7;
+static constexpr uint32_t kProfilerTaskSlotInPlaceTransposeBegin = 8;
+static constexpr uint32_t kProfilerTaskSlotInPlaceTransposeEnd = 9;
+static constexpr uint32_t kProfilerTaskSlotStoreMirrorBegin = 10;
+static constexpr uint32_t kProfilerTaskSlotStoreMirrorEnd = 11;
+
+static constexpr uint32_t kProfilerKSlotWgmmaBegin = 0;
+static constexpr uint32_t kProfilerKSlotWgmmaEnd = 1;
+static constexpr uint32_t kProfilerKSlotScalingBegin = 2;
+static constexpr uint32_t kProfilerKSlotScalingEnd = 3;
+static constexpr uint32_t kProfilerKSlotAccInPlaceAddBegin = 4;
+static constexpr uint32_t kProfilerKSlotAccInPlaceAddEnd = 5;
 
 static constexpr uint32_t kCudaProfilerHeaderU64Words =
     sizeof(CudaProfilerHeader) / sizeof(uint64_t);
@@ -122,8 +129,7 @@ __host__ __device__ __forceinline__ uint32_t cuda_profiler_compact_payload(
 
 __host__ __device__ __forceinline__ uint32_t cuda_profiler_records_per_task(
     uint32_t max_k_tiles_per_task) {
-    (void)max_k_tiles_per_task;
-    return kCudaProfilerTaskSlots;
+    return kCudaProfilerTaskSlots + max_k_tiles_per_task * kCudaProfilerPerKSlots;
 }
 
 __host__ __device__ __forceinline__ uint32_t cuda_profiler_records_per_cta(
@@ -249,9 +255,6 @@ __device__ __forceinline__ int32_t cuda_profiler_task_slot(
     case kProfilerEventScaleLoad:
         return cuda_profiler_begin_end_slot(
             kind, kProfilerTaskSlotScaleLoadBegin, kProfilerTaskSlotScaleLoadEnd);
-    case kProfilerEventMainLoop:
-        return cuda_profiler_begin_end_slot(
-            kind, kProfilerTaskSlotMainLoopBegin, kProfilerTaskSlotMainLoopEnd);
     case kProfilerEventAccumToSmem:
         return cuda_profiler_begin_end_slot(
             kind, kProfilerTaskSlotAccumToSmemBegin, kProfilerTaskSlotAccumToSmemEnd);
@@ -264,6 +267,24 @@ __device__ __forceinline__ int32_t cuda_profiler_task_slot(
     case kProfilerEventStoreMirror:
         return cuda_profiler_begin_end_slot(
             kind, kProfilerTaskSlotStoreMirrorBegin, kProfilerTaskSlotStoreMirrorEnd);
+    default:
+        return kCudaProfilerInvalidSlot;
+    }
+}
+
+__device__ __forceinline__ int32_t cuda_profiler_k_slot(
+    uint32_t event_id,
+    CudaProfilerEventKind kind) {
+    switch (event_id) {
+    case kProfilerEventWgmma:
+        return cuda_profiler_begin_end_slot(
+            kind, kProfilerKSlotWgmmaBegin, kProfilerKSlotWgmmaEnd);
+    case kProfilerEventScaling:
+        return cuda_profiler_begin_end_slot(
+            kind, kProfilerKSlotScalingBegin, kProfilerKSlotScalingEnd);
+    case kProfilerEventAccInPlaceAdd:
+        return cuda_profiler_begin_end_slot(
+            kind, kProfilerKSlotAccInPlaceAddBegin, kProfilerKSlotAccInPlaceAddEnd);
     default:
         return kCudaProfilerInvalidSlot;
     }
@@ -323,6 +344,32 @@ __device__ __forceinline__ void cuda_profiler_record_task_event(
     cuda_profiler_record_slot(layout, slot, event_id, kind, payload0, payload1);
 }
 
+__device__ __forceinline__ void cuda_profiler_record_k_event(
+    const CudaProfilerLayout& layout,
+    uint32_t task_iter,
+    uint32_t k_iter,
+    uint32_t event_id,
+    CudaProfilerEventKind kind,
+    uint32_t payload0,
+    uint32_t payload1) {
+    if (layout.buffer == nullptr) {
+        return;
+    }
+
+    int32_t slot_in_k = cuda_profiler_k_slot(event_id, kind);
+    if (slot_in_k < 0 || task_iter >= layout.max_tasks_per_cta ||
+        k_iter >= layout.buffer->header.max_k_tiles_per_task) {
+        return;
+    }
+
+    uint64_t cta_base = static_cast<uint64_t>(layout.cta_id) * layout.records_per_cta;
+    uint64_t task_base = static_cast<uint64_t>(task_iter) * layout.records_per_task;
+    uint64_t k_base = static_cast<uint64_t>(k_iter) * kCudaProfilerPerKSlots;
+    uint64_t slot = cta_base + kCudaProfilerCtaSlots + task_base +
+                    kCudaProfilerTaskSlots + k_base + static_cast<uint32_t>(slot_in_k);
+    cuda_profiler_record_slot(layout, slot, event_id, kind, payload0, payload1);
+}
+
 #endif // defined(__CUDA_ARCH__)
 
 } // namespace ffjk
@@ -368,6 +415,26 @@ __device__ __forceinline__ void cuda_profiler_record_task_event(
         }                                                                           \
     } while (0)
 
+#define FFJK_PROF_K_BEGIN(event_id, k_iter, payload0, payload1)                     \
+    do {                                                                            \
+        if (threadIdx.x == 0) {                                                     \
+            ffjk::cuda_profiler_record_k_event(                                     \
+                ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
+                static_cast<uint32_t>(k_iter), event_id, ffjk::kProfilerEventBegin, \
+                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+        }                                                                           \
+    } while (0)
+
+#define FFJK_PROF_K_END(event_id, k_iter, payload0, payload1)                       \
+    do {                                                                            \
+        if (threadIdx.x == 0) {                                                     \
+            ffjk::cuda_profiler_record_k_event(                                     \
+                ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
+                static_cast<uint32_t>(k_iter), event_id, ffjk::kProfilerEventEnd,   \
+                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+        }                                                                           \
+    } while (0)
+
 #else
 
 #define FFJK_PROFILER_KERNEL_PARAMS
@@ -377,5 +444,7 @@ __device__ __forceinline__ void cuda_profiler_record_task_event(
 #define FFJK_PROF_CTA_EVENT_PAYLOAD(event_id, payload0, payload1) do {} while (0)
 #define FFJK_PROF_BEGIN(event_id, payload0, payload1) do {} while (0)
 #define FFJK_PROF_END(event_id, payload0, payload1) do {} while (0)
+#define FFJK_PROF_K_BEGIN(event_id, k_iter, payload0, payload1) do {} while (0)
+#define FFJK_PROF_K_END(event_id, k_iter, payload0, payload1) do {} while (0)
 
 #endif // FFJK_ENABLE_CUDA_PROFILER
