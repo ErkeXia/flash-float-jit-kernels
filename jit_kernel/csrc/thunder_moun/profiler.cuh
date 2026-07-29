@@ -20,8 +20,7 @@ enum CudaProfilerEventId : uint32_t {
     kProfilerEventPrefetchData = 20,
     kProfilerEventScaleLoad = 21,
     kProfilerEventWgmma = 30,
-    kProfilerEventScaling = 31,
-    kProfilerEventAccInPlaceAdd = 32,
+    kProfilerEventFmaScaled = 31,
     kProfilerEventAccumToSmem = 40,
     kProfilerEventStoreLower = 42,
     kProfilerEventInPlaceTranspose = 43,
@@ -60,7 +59,7 @@ struct CudaProfilerLayout {
 
 static constexpr uint32_t kCudaProfilerCtaSlots = 1;
 static constexpr uint32_t kCudaProfilerTaskSlots = 12;
-static constexpr uint32_t kCudaProfilerPerKSlots = 6;
+static constexpr uint32_t kCudaProfilerPerKSlots = 4;
 
 static constexpr int32_t kCudaProfilerInvalidSlot = -1;
 static constexpr uint32_t kCudaProfilerTagEventBits = 8;
@@ -84,10 +83,8 @@ static constexpr uint32_t kProfilerTaskSlotStoreMirrorEnd = 11;
 
 static constexpr uint32_t kProfilerKSlotWgmmaBegin = 0;
 static constexpr uint32_t kProfilerKSlotWgmmaEnd = 1;
-static constexpr uint32_t kProfilerKSlotScalingBegin = 2;
-static constexpr uint32_t kProfilerKSlotScalingEnd = 3;
-static constexpr uint32_t kProfilerKSlotAccInPlaceAddBegin = 4;
-static constexpr uint32_t kProfilerKSlotAccInPlaceAddEnd = 5;
+static constexpr uint32_t kProfilerKSlotFmaScaledBegin = 2;
+static constexpr uint32_t kProfilerKSlotFmaScaledEnd = 3;
 
 static constexpr uint32_t kCudaProfilerHeaderU64Words =
     sizeof(CudaProfilerHeader) / sizeof(uint64_t);
@@ -279,12 +276,9 @@ __device__ __forceinline__ int32_t cuda_profiler_k_slot(
     case kProfilerEventWgmma:
         return cuda_profiler_begin_end_slot(
             kind, kProfilerKSlotWgmmaBegin, kProfilerKSlotWgmmaEnd);
-    case kProfilerEventScaling:
+    case kProfilerEventFmaScaled:
         return cuda_profiler_begin_end_slot(
-            kind, kProfilerKSlotScalingBegin, kProfilerKSlotScalingEnd);
-    case kProfilerEventAccInPlaceAdd:
-        return cuda_profiler_begin_end_slot(
-            kind, kProfilerKSlotAccInPlaceAddBegin, kProfilerKSlotAccInPlaceAddEnd);
+            kind, kProfilerKSlotFmaScaledBegin, kProfilerKSlotFmaScaledEnd);
     default:
         return kCudaProfilerInvalidSlot;
     }

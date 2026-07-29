@@ -369,25 +369,13 @@ struct HopperPersistentSplitKPipeline {
                     k_payload);
 
                 FFJK_PROF_K_BEGIN(
-                    ffjk::kProfilerEventScaling,
+                    ffjk::kProfilerEventFmaScaled,
                     k_iter,
                     task_id,
                     k_payload);
-                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
+                accum.fma_scaled_(local_step_accum, &shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 FFJK_PROF_K_END(
-                    ffjk::kProfilerEventScaling,
-                    k_iter,
-                    task_id,
-                    k_payload);
-
-                FFJK_PROF_K_BEGIN(
-                    ffjk::kProfilerEventAccInPlaceAdd,
-                    k_iter,
-                    task_id,
-                    k_payload);
-                accum.add_(local_step_accum);
-                FFJK_PROF_K_END(
-                    ffjk::kProfilerEventAccInPlaceAdd,
+                    ffjk::kProfilerEventFmaScaled,
                     k_iter,
                     task_id,
                     k_payload);
