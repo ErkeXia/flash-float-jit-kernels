@@ -26,7 +26,7 @@ from jit_kernel.utils import KERNEL_PATH
 extra_ldflags = ["-lcudart", "-lcuda"]
 
 cuda_sources = [
-    str(KERNEL_PATH / "csrc" / "thunder_moun/symm_gemm.cu"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy.h"),
@@ -36,8 +36,9 @@ cuda_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/block.h"),
-    str(KERNEL_PATH / "csrc" / "thunder_moun/block/producer.h"),
-    str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_gemm_scaled_impl.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/sched.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/fragment.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/nv_frag_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/array_ref.h"),

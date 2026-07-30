@@ -62,7 +62,7 @@ namespace cg = cooperative_groups;
 #include "block/block.h"
 
 // TODO (yiakwy) : move to xpu general interface
-#include "block/nv_block_gemm_scaled_impl.h"
+#include "block/nv_block_1p2c_gemm_scaled_impl.h"
 
 #include "arch/tma/tma_desc.h"
 
@@ -85,7 +85,8 @@ constexpr int CLUSTER_SIZE_M = 2; // GROUP_SIZE_M / 2;
 constexpr int WARP_SIZE = 32;
 #endif
 
-constexpr int NUM_WARPS = 8;
+// WASP wgemm (1p2c) scheme uses 12 warps
+constexpr int NUM_WARPS = 12;
 
 constexpr int TOTAL_WARP_THREADS = NUM_WARPS * WARP_SIZE;
 
@@ -113,8 +114,11 @@ void hopper_symm_gemm_kernel_entry(
     uint8_t* smem_buffer = reinterpret_cast<uint8_t*>(aligned_smem);
     */
 
+    // TODO (yiakwy) : move to compute groups
+    /*
     xpu::HopperWGMMAAccumulator<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K> accumulator_fragment;
     accumulator_fragment.clear();
+    */
 
     // if (threadIdx.x == 0 && blockIdx.x == 1) {
     //     printf("[hopper_symm_gemm_kernel_entry] [split_k#%d] [SM#%d] enter into HopperPersistentSplitKPipeline ...\n", blockIdx.x, blockIdx.y);
@@ -123,11 +127,10 @@ void hopper_symm_gemm_kernel_entry(
 
     if (cluster_size_m < 8) {
         xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 4>::run_persistent(
-            accumulator_fragment,
+            // accumulator_fragment,
             &tma_desc_X,
             &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
+            &tma_desc_O, &tma_desc_O_swizzle,
             scale_X,
             scale_W,
             Out, M, N, K,
@@ -139,11 +142,10 @@ void hopper_symm_gemm_kernel_entry(
     } else
     if (cluster_size_m < 4) {
         xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 2>::run_persistent(
-            accumulator_fragment,
+            // accumulator_fragment,
             &tma_desc_X,
             &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
+            &tma_desc_O, &tma_desc_O_swizzle,
             scale_X,
             scale_W,
             Out, M, N, K,
@@ -155,11 +157,10 @@ void hopper_symm_gemm_kernel_entry(
     } else
     if (cluster_size_m < 2) {
         xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 1>::run_persistent(
-            accumulator_fragment,
+            // accumulator_fragment,
             &tma_desc_X,
             &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
+            &tma_desc_O, &tma_desc_O_swizzle,
             scale_X,
             scale_W,
             Out, M, N, K,

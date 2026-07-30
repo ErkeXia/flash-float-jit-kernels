@@ -7,6 +7,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+// NOTE (yiakwy)
+// tma/tma_barrier.h defines mbarrier behaviors to cooperate with TMA operations, including barrier initialization, wait, and arrive (tma_expect_bytes) operations.
+
 namespace nvgpu {
 namespace arch {
 

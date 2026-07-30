@@ -22,7 +22,7 @@ std::ostream& operator<<(std::ostream& os, const xpu::Tuple<T, U>& t) {
 }
 */
 
-
+// test suite 1
 void test_balanced_tri_linear_sched_simple_case() {
     using namespace xpu;
 
@@ -36,6 +36,7 @@ void test_balanced_tri_linear_sched_simple_case() {
         {3, 1},   // 2
         {3, 2},   // 3
         {3, 3},   // 4
+
         {1, 0},   // 5
         {1, 1},   // 6
         {2, 0},   // 7
@@ -43,10 +44,11 @@ void test_balanced_tri_linear_sched_simple_case() {
         {2, 2}    // 9
     };
 
+    std::cout << "=== test_balanced_tri_linear_sched_simple_case : ===\n";
     std::cout << "=== Test 1: Forward mapping (task_id -> block) ===\n";
     bool all_forward_ok = true;
     for (int tid = 0; tid < total_tiles; ++tid) {
-        auto idx = get_block_indices_optimized(tid, num_blocks_m);
+        auto idx = get_block_indices_tri_linear_optimized(tid, num_blocks_m);
         int bm = xpu::get<0>(idx);
         int bn = xpu::get<1>(idx);
 
@@ -68,11 +70,11 @@ void test_balanced_tri_linear_sched_simple_case() {
     std::cout << "\n=== Test 2: Reverse mapping (block -> task_id) ===\n";
     bool all_reverse_ok = true;
     for (int tid = 0; tid < total_tiles; ++tid) {
-        auto idx = get_block_indices_optimized(tid, num_blocks_m);
+        auto idx = get_block_indices_tri_linear_optimized(tid, num_blocks_m);
         int bm = xpu::get<0>(idx);
         int bn = xpu::get<1>(idx);
 
-        int rev_tid = get_task_id_from_block(bm, bn, num_blocks_m);
+        int rev_tid = get_task_id_from_block_indices_tri_linear_optimized(bm, bn, num_blocks_m);
 
         bool ok = (rev_tid == tid);
 
@@ -90,7 +92,7 @@ void test_balanced_tri_linear_sched_simple_case() {
     std::cout << "\n=== Test 3: All generated blocks cover entire lower triangular ===\n";
     std::map<std::pair<int,int>, int> coverage;
     for (int tid = 0; tid < total_tiles; ++tid) {
-        auto idx = get_block_indices_optimized(tid, num_blocks_m);
+        auto idx = get_block_indices_tri_linear_optimized(tid, num_blocks_m);
         coverage[{xpu::get<0>(idx), xpu::get<1>(idx)}]++;
     }
     bool all_covered = true;
@@ -110,7 +112,125 @@ void test_balanced_tri_linear_sched_simple_case() {
         std::cout << "\nSome tests FAILED.\n";
 }
 
+
+// test suite 2
+void test_gaussian_folding_swizzled_sched_simple_case() {
+    using namespace xpu;
+
+    const int num_blocks_m = 4;
+    const int total_tiles = (num_blocks_m * (num_blocks_m + 1)) / 2;
+
+    // Test Case 4x4 blocks, total tiles 10
+    std::vector<std::pair<int, int>> expected = {
+        {0, 0},   // original task_id 0
+        {1, 0},   // 5
+
+        {3, 0},   // 1
+        {1, 1},   // 6
+
+        {3, 1},   // 2
+        {2, 0},   // 7
+
+        {3, 2},   // 3
+        {2, 1},   // 8
+
+        {3, 3},   // 4
+        {2, 2}    // 9
+    };
+
+    std::cout << "=== test_gaussian_folding_swizzled_sched_simple_case : ===\n";
+    std::cout << "=== Forward mapping (task_id -> block) ===\n";
+    bool all_forward_ok = true;
+
+    constexpr int GROUP_SIZE_M = 2;
+
+    int row_size = num_blocks_m + 1;
+    int group_size = row_size * GROUP_SIZE_M;
+
+    for (int tid = 0; tid < total_tiles; ++tid) {
+        int bm, bn;
+
+        int group_id = tid / group_size;
+        gaussian_folding_swizzled<GROUP_SIZE_M, false>(tid, bm, bn, num_blocks_m);
+
+        auto [ebm, ebn] = expected[tid];
+
+        bool ok = (bm == ebm && bn == ebn);
+
+        std::cout << "task_id " << tid << " -> block(" << bm << "," << bn << ") ";
+        if (ok) {
+            std::cout << "✓";
+        } else {
+            std::cout << "✗ (expected (" << ebm << "," << ebn << "))";
+        }
+        std::cout << std::endl;
+
+        if (!ok) all_forward_ok = false;
+    }
+
+}
+
+
+// test suite 3
+void test_gaussian_folding_zig_zag_swizzled_sched_simple_case() {
+    using namespace xpu;
+
+    const int num_blocks_m = 4;
+    const int total_tiles = (num_blocks_m * (num_blocks_m + 1)) / 2;
+
+    // Test Case 4x4 blocks, total tiles 10
+    std::vector<std::pair<int, int>> expected = {
+        {0, 0},   // original task_id 0
+        {1, 0},   // 5
+
+        {1, 1},   // 6 !
+        {3, 0},   // 1
+
+        {3, 1},   // 2
+        {2, 0},   // 7
+
+        {2, 1},   // 8 !
+        {3, 2},   // 3
+
+        {3, 3},   // 4
+        {2, 2}    // 9
+    };
+
+    std::cout << "=== test_gaussian_folding_zig_zag_swizzled_sched_simple_case : ===\n";
+    std::cout << "=== Forward mapping (task_id -> block) ===\n";
+    bool all_forward_ok = true;
+
+    constexpr int GROUP_SIZE_M = 2;
+
+    int row_size = num_blocks_m + 1;
+    int group_size = row_size * GROUP_SIZE_M;
+
+    for (int tid = 0; tid < total_tiles; ++tid) {
+        int bm, bn;
+
+        int group_id = tid / group_size;
+        gaussian_folding_swizzled<GROUP_SIZE_M>(tid, bm, bn, num_blocks_m);
+
+        auto [ebm, ebn] = expected[tid];
+
+        bool ok = (bm == ebm && bn == ebn);
+
+        std::cout << "task_id " << tid << " -> block(" << bm << "," << bn << ") ";
+        if (ok) {
+            std::cout << "✓";
+        } else {
+            std::cout << "✗ (expected (" << ebm << "," << ebn << "))";
+        }
+        std::cout << std::endl;
+
+        if (!ok) all_forward_ok = false;
+    }
+
+}
+
 int main() {
     test_balanced_tri_linear_sched_simple_case();
+    test_gaussian_folding_swizzled_sched_simple_case();
+    test_gaussian_folding_zig_zag_swizzled_sched_simple_case();
     return 0;
 }

@@ -16,6 +16,8 @@ enum class CacheHintSm90 : uint64_t {
   EVICT_LAST = 0x14F0000000000000,
 };
 
+// NOTE (yiakwy) : TMA bulk tensor (multi-dimension) copy (cp.async.bulk.tensor) exclusively used for bulk tensor copy between shared memory and global memory, with support of cluster multicast and L2 cache hint for TMA load operations.
+
 __device__ __inline__ void tma2d_multicast_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
                                                       uint32_t s_w_mbar_addr, /*mbarrier*/
                                                       const int32_t inner_dim_offset, const int32_t outter_dim_offset,

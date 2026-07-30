@@ -96,12 +96,6 @@ struct HopperWGMMAAccumulator {
 
         const int col = thr_off_col * VEC_SIZE + i * COL_STRIDE + (sub_idx % VEC_SIZE);
 
-        // // if (blockIdx.y == 1 && (row == 127) && col == 0) {
-        // if (blockIdx.y == 2 && (row == 127) && col == 127) {
-        //     printf("[getTargetWgmmaSmemOffset] [Split#%d] [SM#%d] [wg_id#%d] [wg_lane_id#%d] [tid#%d] SmemFrag[%d, %d] = RegFrag[%d] = %f\n", blockIdx.x, blockIdx.y, wg_id, wg_lane_id, threadIdx.x, row, col, reg_idx, regs[m_step][reg_idx]);
-        // }
-        // __syncthreads();
-
         if (dest_row != nullptr) {
             *dest_row = row;
         }
@@ -125,11 +119,6 @@ struct HopperWGMMAAccumulator {
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
-        // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-        //     printf("[HopperWGMMAAccumulator::store_to_smem]: wg_id=%d, wg_lane_id=%d, M_STEPS=%d\n", wg_id, wg_lane_id, M_STEPS);
-        // }
-        // __syncthreads();
-
         #pragma unroll
         for (int m_step = 0; m_step < M_STEPS; ++m_step) {
             #pragma unroll
@@ -141,15 +130,9 @@ struct HopperWGMMAAccumulator {
                 } else {
                     smem[smem_offset] = regs[m_step][i];
                 }
-
-                // // if (blockIdx.y == 1 && (smem_offset == 127 * 128)) {
-                // if (blockIdx.y == 2 && (smem_offset == 127 * 128 + 127)) {
-                //     printf("[store] [Split#%d] [SM#%d] SmemFrag[%d] = %f, RegFrag[%d] = %f\n", blockIdx.x, blockIdx.y, smem_offset, smem[smem_offset], i, regs[m_step][i]);
-                // }
-
             }
         }
-        __syncthreads();
+        __syncwarp();
     }
 
     __device__ inline void mul_(float scale) {
@@ -186,11 +169,6 @@ struct HopperWGMMAAccumulator {
 
                 float scale = xs[k_offset * BM + row] * _ws;
 
-                // if (threadIdx.x == 0) {
-                //     printf("[mul_] [Split#%d] [SM#%d] wg_id=%d, wg_lane_id=%d, reg_idx=%d, SmemFrag[%d, %d] = %f, scale_xs[%d]=%f, scale_ws[%d]=%f, final_scale=%f\n", blockIdx.x, blockIdx.y, wg_id, wg_lane_id, i, row, col, regs[m_step][i], row, xs[row], k_offset, _ws, scale);
-                // }
-                // __syncthreads();
-
                 regs[m_step][i] *= scale;
             }
         }
@@ -204,10 +182,6 @@ struct HopperWGMMAAccumulator {
         for (int m_step = 0; m_step < M_STEPS; ++m_step) {
             #pragma unroll
             for (int i = 0; i < kRegistersPerThread; ++i) {
-                // if (threadIdx.x == 0 && blockIdx.x == 0  && blockIdx.y == 0) {
-                //     printf("[HopperWGMMAAccumulator::add]: regs[%d][%d] (%f) += %f\n", m_step, i, this->regs[m_step][i], b.regs[m_step][i]);
-                // }
-                // __syncthreads();
                 this->regs[m_step][i] += b.regs[m_step][i];
             }
         }
@@ -312,14 +286,10 @@ struct HopperWGMMAExecutor {
         auto shift_sign = (1ULL << 62);
         // auto shift_sign = (3ULL << 60);
 
+        // TODO (yiakwy) : nvgpu::arch::wgmma_fence_sync_aligned()
         asm volatile(
             "wgmma.fence.sync.aligned;\n" ::: "memory"
         );
-
-        // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-        //     printf("[mma_scaled] M_STEPS=%d, N_STEPS=%d, K_STEPS=%d\n", M_STEPS, N_STEPS, K_STEPS);
-        // }
-        // __syncthreads();
 
         #pragma unroll
         for (int m_step = 0; m_step < M_STEPS; ++m_step) {

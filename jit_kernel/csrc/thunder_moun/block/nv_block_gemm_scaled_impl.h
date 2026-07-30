@@ -22,6 +22,7 @@ namespace cg = cooperative_groups;
 
 #include "block.h"
 #include "producer.h"
+#include "sched.h"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -69,6 +70,27 @@ struct HopperPersistentSplitKPipeline {
         const int tid = threadIdx.x;
         // const int lane_id = threadIdx.x % WARP_SIZE;
         // const int warp_id = threadIdx.x / WARP_SIZE;
+
+        if (tid == 0) {
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            }
+
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_W);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            }
+        }
+        __syncwarp();
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
@@ -134,6 +156,7 @@ struct HopperPersistentSplitKPipeline {
             cluster_mask |= (1 << target_rank);
         }
 #endif
+
         const int k_tiles_total = (K + BK - 1) / BK;
 
         int k_tiles_per_slice = (k_tiles_total + split_k - 1) / split_k;
@@ -157,57 +180,29 @@ struct HopperPersistentSplitKPipeline {
             // NOTE (yiakwy) : we only support symmetric gemm, hence force to use linear to triangular mapping for block-level tile assignment.
             // TODO (yiakwy) : precompute the block_idx_m and block_idx_n for each local_task_id and store in shared memory to avoid redundant computation on the fly and reduce the latency.
 #ifdef USE_LINEAR_TO_TRIL_LAYOUT
-            int block_idx_m = int((sqrt(8.0 * local_task_id + 1.0) - 1.0) / 2.0);
-            int block_idx_n = local_task_id - (block_idx_m * (block_idx_m + 1)) / 2;
-#else
-            int block_idx_m = local_task_id / num_blocks_n;
-            int block_idx_n = local_task_id % num_blocks_n;
-#endif
-
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("[pre] [Split#%d] [SM#%d] block#(%d, %d) initiate TAM loading ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-            // }
+            auto idx = get_block_indices_tri_linear(local_task_id);
+            int block_idx_m = xpu::get<0>(idx);
+            int block_idx_n = xpu::get<1>(idx);
 
             // Grouping for better L2 cache locality in TMA load
             const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
 
-            // NOTE (yaikwy) : group swizzle after Down-Left Triangular Mapping for better L2 cache locality in TMA load
-            if constexpr (GROUP_SIZE_M > 1) {
-                const uint32_t group_off_row = group_id * GROUP_SIZE_M;
-                const uint32_t group_size_m = min(num_blocks_m - group_off_row, static_cast<uint32_t>(GROUP_SIZE_M));
+            get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+#else
+            auto idx = get_block_indices_tri_linear_optimized(local_task_id, num_blocks_m);
+            int block_idx_m = xpu::get<0>(idx);
+            int block_idx_n = xpu::get<1>(idx);
 
-                auto sum_tri = [](int h) {
-                    return h * (h + 1) / 2;
-                };
+            // Grouping for better L2 cache locality in TMA load
+            int row_size = num_blocks_m + 1;
+            int group_size = row_size * GROUP_SIZE_M;
 
-                const uint32_t og_off = sum_tri(group_off_row);
-                const uint32_t res = sum_tri(group_size_m);
+            const uint32_t group_id = local_task_id / group_size;
 
-                const uint32_t num_blocks_in_group = sum_tri(group_off_row + group_size_m) - og_off;
-                const uint32_t in_group_idx = local_task_id - og_off;
+            gaussian_folding_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m, block_idx_n, num_blocks_m);
 
-                const uint32_t test_col = in_group_idx / group_size_m;
-
-                if (test_col < group_off_row) {
-                    block_idx_m = group_off_row + (in_group_idx % group_size_m);
-                    block_idx_n = test_col;
-                } else {
-                    const uint32_t ig_col_off = group_off_row;
-                    const uint32_t sub_in_group_id = in_group_idx - ig_col_off * group_size_m;
-
-                    // NOTE (yiakwy) : since int ( sqrt( gm^2 + gm - 2ig_id - 1/4) - 1/2 ) - 1 < c0 <= sqrt( gm^2 + gm - 2ig_id - 1/4) - 1/2 )
-                    const uint32_t c0 = int ( sqrt( group_size_m*group_size_m + group_size_m - 2*sub_in_group_id - 1.0/4) - 1.0/2 );
-                    const uint32_t c0_plus_1 = c0 + 1;
-                    const uint32_t c1 = group_size_m - c0_plus_1;
-
-                    block_idx_n = ig_col_off + c1;
-                    block_idx_m = group_off_row + (sub_in_group_id - (group_size_m + c0_plus_1 + 1) * (group_size_m - c0_plus_1) / 2) + c1;
-                }
-            }
-
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("[after] [Split#%d] [SM#%d] block#(%d, %d) initiate TAM loading ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-            // }
+            static_assert(USE_CLUSTER_MULTICAST == false, "symmetric gemm with Gaussian Folding Swizzle does not support cluster multicast!");
+#endif
 
             int write_stage = 0;
             int read_stage = 0;
@@ -396,7 +391,6 @@ struct HopperPersistentSplitKPipeline {
                     );
                 }
 
-#if (defined(USE_LINEAR_TO_TRIL_LAYOUT)) && USE_LINEAR_TO_TRIL_LAYOUT
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
 
@@ -455,8 +449,6 @@ struct HopperPersistentSplitKPipeline {
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
                 } // block_idx_m > block_idx_n
-
-#endif // USE_LINEAR_TO_TRIL_LAYOUT
 
             } // split_id == 0
             cluster.sync();
