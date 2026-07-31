@@ -184,7 +184,7 @@ struct HopperWGMMAAccumulator {
                 int row, col;
                 int _ = getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
 
-                float scale = xs[k_offset * BM + row] * _ws;
+                float scale = xs[k_offset * (BM + 1) + row] * _ws;
 
                 // if (threadIdx.x == 0) {
                 //     printf("[mul_] [Split#%d] [SM#%d] wg_id=%d, wg_lane_id=%d, reg_idx=%d, SmemFrag[%d, %d] = %f, scale_xs[%d]=%f, scale_ws[%d]=%f, final_scale=%f\n", blockIdx.x, blockIdx.y, wg_id, wg_lane_id, i, row, col, regs[m_step][i], row, xs[row], k_offset, _ws, scale);
@@ -238,8 +238,8 @@ struct HopperWGMMAAccumulator {
 
             const int row1 = row0 + 8;
 
-            const float scale0 = xs[k_offset * BM + row0] * _ws;
-            const float scale1 = xs[k_offset * BM + row1] * _ws;
+            const float scale0 = xs[k_offset * (BM + 1) + row0] * _ws;
+            const float scale1 = xs[k_offset * (BM + 1) + row1] * _ws;
 
             #pragma unroll
             for (int i = 0; i < (kRegistersPerThread / 4); ++i) {

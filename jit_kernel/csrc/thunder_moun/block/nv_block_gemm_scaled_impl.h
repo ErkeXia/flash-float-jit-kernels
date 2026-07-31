@@ -101,7 +101,7 @@ struct HopperPersistentSplitKPipeline {
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
-        __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
+        __shared__ __align__(128) float shmem_XS[(BM + 1) * K_TILES_TOTAL]; // avoid bank conflict
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
@@ -280,7 +280,7 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
+                shmem_XS[s_col * (BM + 1) + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();
 
