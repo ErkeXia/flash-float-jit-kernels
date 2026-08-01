@@ -34,16 +34,12 @@ struct alignas(32) CudaProfilerHeader {
     uint32_t records_per_task;
     uint32_t max_tasks_per_cta;
     uint32_t max_k_tiles_per_task;
-    uint32_t cta_slots;
+    uint32_t cta_slots_and_version;
     uint32_t per_k_slots;
 };
 
-struct alignas(16) CudaProfilerRecord {
-    uint64_t timestamp;
-    uint32_t payload;
-    uint16_t tag;
-    uint16_t smid;
-};
+// Event identity and coordinates are encoded by the record's fixed slot.
+using CudaProfilerRecord = uint32_t;
 
 struct alignas(32) CudaProfilerBuffer {
     CudaProfilerHeader header;
@@ -60,11 +56,9 @@ struct CudaProfilerLayout {
 static constexpr uint32_t kCudaProfilerCtaSlots = 1;
 static constexpr uint32_t kCudaProfilerTaskSlots = 12;
 static constexpr uint32_t kCudaProfilerPerKSlots = 4;
+static constexpr uint32_t kCudaProfilerFormatVersion = 2;
 
 static constexpr int32_t kCudaProfilerInvalidSlot = -1;
-static constexpr uint32_t kCudaProfilerTagEventBits = 8;
-static constexpr uint32_t kCudaProfilerTagKindShift = 8;
-static constexpr uint32_t kCudaProfilerTagFlagsShift = 10;
 
 static constexpr uint32_t kProfilerCtaSlotKernelLaunch = 0;
 
@@ -88,40 +82,18 @@ static constexpr uint32_t kProfilerKSlotFmaScaledEnd = 3;
 
 static constexpr uint32_t kCudaProfilerHeaderU64Words =
     sizeof(CudaProfilerHeader) / sizeof(uint64_t);
-static constexpr uint32_t kCudaProfilerRecordU64Words =
-    sizeof(CudaProfilerRecord) / sizeof(uint64_t);
 
 static_assert(sizeof(CudaProfilerHeader) % sizeof(uint64_t) == 0,
               "CudaProfilerHeader must be uint64_t-aligned for Python tensor allocation.");
 static_assert(sizeof(CudaProfilerHeader) == 32,
               "CudaProfilerHeader must stay 32 bytes to keep records aligned.");
-static_assert(sizeof(CudaProfilerRecord) == 16,
-              "CudaProfilerRecord must stay 16 bytes for low-overhead host parsing.");
+static_assert(sizeof(CudaProfilerRecord) == 4,
+              "CudaProfilerRecord must stay 4 bytes for timestamp-only profiling.");
 
 __host__ __device__ __forceinline__ uint32_t cuda_profiler_pack_u16(
     uint32_t lo,
     uint32_t hi) {
     return (lo & 0xffffu) | ((hi & 0xffffu) << 16);
-}
-
-__host__ __device__ __forceinline__ uint16_t cuda_profiler_make_tag(
-    uint32_t event_id,
-    CudaProfilerEventKind kind,
-    uint32_t flags = 0) {
-    return static_cast<uint16_t>(
-        (event_id & ((1u << kCudaProfilerTagEventBits) - 1u)) |
-        ((static_cast<uint32_t>(kind) & 0x3u) << kCudaProfilerTagKindShift) |
-        ((flags & 0x3fu) << kCudaProfilerTagFlagsShift));
-}
-
-__host__ __device__ __forceinline__ uint32_t cuda_profiler_compact_payload(
-    uint32_t event_id,
-    uint32_t payload0,
-    uint32_t payload1) {
-    if (event_id == kProfilerEventKernelLaunch) {
-        return cuda_profiler_pack_u16(payload0, payload1);
-    }
-    return payload1 != 0 ? payload1 : payload0;
 }
 
 __host__ __device__ __forceinline__ uint32_t cuda_profiler_records_per_task(
@@ -173,7 +145,8 @@ inline cudaError_t cuda_profiler_init(
     header.records_per_task = cuda_profiler_records_per_task(max_k_tiles_per_task);
     header.records_per_cta = cuda_profiler_records_per_cta(
         max_tasks_per_cta, max_k_tiles_per_task);
-    header.cta_slots = kCudaProfilerCtaSlots;
+    header.cta_slots_and_version = cuda_profiler_pack_u16(
+        kCudaProfilerCtaSlots, kCudaProfilerFormatVersion);
     header.per_k_slots = kCudaProfilerPerKSlots;
 
     return cudaMemcpyAsync(
@@ -182,16 +155,10 @@ inline cudaError_t cuda_profiler_init(
 
 #if defined(__CUDA_ARCH__)
 
-__device__ __forceinline__ uint64_t cuda_profiler_read_timestamp() {
-    uint64_t timestamp;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
+__device__ __forceinline__ uint32_t cuda_profiler_read_timestamp() {
+    uint32_t timestamp;
+    asm volatile("mov.u32 %0, %%globaltimer_lo;" : "=r"(timestamp));
     return timestamp;
-}
-
-__device__ __forceinline__ uint32_t cuda_profiler_read_smid() {
-    uint32_t smid;
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    return smid;
 }
 
 __device__ __forceinline__ CudaProfilerRecord* cuda_profiler_records(
@@ -286,29 +253,19 @@ __device__ __forceinline__ int32_t cuda_profiler_k_slot(
 
 __device__ __forceinline__ void cuda_profiler_record_slot(
     const CudaProfilerLayout& layout,
-    uint64_t slot,
-    uint32_t event_id,
-    CudaProfilerEventKind kind,
-    uint32_t payload0,
-    uint32_t payload1) {
+    uint64_t slot) {
     if (layout.buffer == nullptr || slot >= layout.buffer->header.capacity) {
         return;
     }
 
     CudaProfilerRecord* records = cuda_profiler_records(layout.buffer);
-    CudaProfilerRecord& record = records[slot];
-    record.timestamp = cuda_profiler_read_timestamp();
-    record.payload = cuda_profiler_compact_payload(event_id, payload0, payload1);
-    record.tag = cuda_profiler_make_tag(event_id, kind);
-    record.smid = static_cast<uint16_t>(cuda_profiler_read_smid());
+    records[slot] = cuda_profiler_read_timestamp();
 }
 
 __device__ __forceinline__ void cuda_profiler_record_cta_event(
     const CudaProfilerLayout& layout,
     uint32_t event_id,
-    CudaProfilerEventKind kind,
-    uint32_t payload0,
-    uint32_t payload1) {
+    CudaProfilerEventKind kind) {
     int32_t slot_in_cta = cuda_profiler_cta_slot(event_id, kind);
     if (slot_in_cta < 0) {
         return;
@@ -316,16 +273,14 @@ __device__ __forceinline__ void cuda_profiler_record_cta_event(
 
     uint64_t slot = static_cast<uint64_t>(layout.cta_id) * layout.records_per_cta +
                     static_cast<uint32_t>(slot_in_cta);
-    cuda_profiler_record_slot(layout, slot, event_id, kind, payload0, payload1);
+    cuda_profiler_record_slot(layout, slot);
 }
 
 __device__ __forceinline__ void cuda_profiler_record_task_event(
     const CudaProfilerLayout& layout,
     uint32_t task_iter,
     uint32_t event_id,
-    CudaProfilerEventKind kind,
-    uint32_t payload0,
-    uint32_t payload1) {
+    CudaProfilerEventKind kind) {
     int32_t slot_in_task = cuda_profiler_task_slot(event_id, kind);
     if (slot_in_task < 0 || task_iter >= layout.max_tasks_per_cta) {
         return;
@@ -335,7 +290,7 @@ __device__ __forceinline__ void cuda_profiler_record_task_event(
     uint64_t task_base = static_cast<uint64_t>(task_iter) * layout.records_per_task;
     uint64_t slot = cta_base + kCudaProfilerCtaSlots + task_base +
                     static_cast<uint32_t>(slot_in_task);
-    cuda_profiler_record_slot(layout, slot, event_id, kind, payload0, payload1);
+    cuda_profiler_record_slot(layout, slot);
 }
 
 __device__ __forceinline__ void cuda_profiler_record_k_event(
@@ -343,9 +298,7 @@ __device__ __forceinline__ void cuda_profiler_record_k_event(
     uint32_t task_iter,
     uint32_t k_iter,
     uint32_t event_id,
-    CudaProfilerEventKind kind,
-    uint32_t payload0,
-    uint32_t payload1) {
+    CudaProfilerEventKind kind) {
     if (layout.buffer == nullptr) {
         return;
     }
@@ -361,7 +314,7 @@ __device__ __forceinline__ void cuda_profiler_record_k_event(
     uint64_t k_base = static_cast<uint64_t>(k_iter) * kCudaProfilerPerKSlots;
     uint64_t slot = cta_base + kCudaProfilerCtaSlots + task_base +
                     kCudaProfilerTaskSlots + k_base + static_cast<uint32_t>(slot_in_k);
-    cuda_profiler_record_slot(layout, slot, event_id, kind, payload0, payload1);
+    cuda_profiler_record_slot(layout, slot);
 }
 
 #endif // defined(__CUDA_ARCH__)
@@ -380,52 +333,49 @@ __device__ __forceinline__ void cuda_profiler_record_k_event(
         static_cast<uint32_t>(total_symmetric_tiles),                               \
         static_cast<uint32_t>(max_k_tiles_per_task))
 
-#define FFJK_PROF_CTA_EVENT_PAYLOAD(event_id, payload0, payload1)                  \
+#define FFJK_PROF_CTA_EVENT(event_id)                                               \
     do {                                                                            \
         if (threadIdx.x == 0) {                                                     \
             ffjk::cuda_profiler_record_cta_event(                                   \
-                ffjk_prof_layout, event_id, ffjk::kProfilerEventInstant,            \
-                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+                ffjk_prof_layout, event_id, ffjk::kProfilerEventInstant);            \
         }                                                                           \
     } while (0)
 
-#define FFJK_PROF_BEGIN(event_id, payload0, payload1)                               \
+#define FFJK_PROF_BEGIN(event_id)                                                    \
     do {                                                                            \
         if (threadIdx.x == 0) {                                                     \
             ffjk::cuda_profiler_record_task_event(                                  \
                 ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
-                event_id, ffjk::kProfilerEventBegin,                                \
-                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+                event_id, ffjk::kProfilerEventBegin);                               \
         }                                                                           \
     } while (0)
 
-#define FFJK_PROF_END(event_id, payload0, payload1)                                 \
+#define FFJK_PROF_END(event_id)                                                      \
     do {                                                                            \
         if (threadIdx.x == 0) {                                                     \
             ffjk::cuda_profiler_record_task_event(                                  \
                 ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
-                event_id, ffjk::kProfilerEventEnd,                                  \
-                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+                event_id, ffjk::kProfilerEventEnd);                                 \
         }                                                                           \
     } while (0)
 
-#define FFJK_PROF_K_BEGIN(event_id, k_iter, payload0, payload1)                     \
+#define FFJK_PROF_K_BEGIN(event_id, k_iter)                                         \
     do {                                                                            \
         if (threadIdx.x == 0) {                                                     \
             ffjk::cuda_profiler_record_k_event(                                     \
                 ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
-                static_cast<uint32_t>(k_iter), event_id, ffjk::kProfilerEventBegin, \
-                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+                static_cast<uint32_t>(k_iter), event_id,                           \
+                ffjk::kProfilerEventBegin);                                        \
         }                                                                           \
     } while (0)
 
-#define FFJK_PROF_K_END(event_id, k_iter, payload0, payload1)                       \
+#define FFJK_PROF_K_END(event_id, k_iter)                                           \
     do {                                                                            \
         if (threadIdx.x == 0) {                                                     \
             ffjk::cuda_profiler_record_k_event(                                     \
                 ffjk_prof_layout, static_cast<uint32_t>(ffjk_prof_task_iter),       \
-                static_cast<uint32_t>(k_iter), event_id, ffjk::kProfilerEventEnd,   \
-                static_cast<uint32_t>(payload0), static_cast<uint32_t>(payload1));  \
+                static_cast<uint32_t>(k_iter), event_id,                           \
+                ffjk::kProfilerEventEnd);                                          \
         }                                                                           \
     } while (0)
 
@@ -435,10 +385,10 @@ __device__ __forceinline__ void cuda_profiler_record_k_event(
 #define FFJK_PROFILER_KERNEL_ARGS
 #define FFJK_PROFILER_LAUNCH_ARG(profiler)
 #define FFJK_PROFILER_DEFINE_LAYOUT(total_symmetric_tiles, max_k_tiles_per_task)
-#define FFJK_PROF_CTA_EVENT_PAYLOAD(event_id, payload0, payload1) do {} while (0)
-#define FFJK_PROF_BEGIN(event_id, payload0, payload1) do {} while (0)
-#define FFJK_PROF_END(event_id, payload0, payload1) do {} while (0)
-#define FFJK_PROF_K_BEGIN(event_id, k_iter, payload0, payload1) do {} while (0)
-#define FFJK_PROF_K_END(event_id, k_iter, payload0, payload1) do {} while (0)
+#define FFJK_PROF_CTA_EVENT(event_id) do {} while (0)
+#define FFJK_PROF_BEGIN(event_id) do {} while (0)
+#define FFJK_PROF_END(event_id) do {} while (0)
+#define FFJK_PROF_K_BEGIN(event_id, k_iter) do {} while (0)
+#define FFJK_PROF_K_END(event_id, k_iter) do {} while (0)
 
 #endif // FFJK_ENABLE_CUDA_PROFILER

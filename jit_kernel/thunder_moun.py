@@ -108,10 +108,15 @@ MAX_SPLIT_K = 8
 CLUSTER_SIZE_M = 2
 
 CUDA_PROFILER_HEADER_U64_WORDS = 4
-CUDA_PROFILER_RECORD_U64_WORDS = 2
+CUDA_PROFILER_RECORDS_PER_U64 = 2
+CUDA_PROFILER_FORMAT_VERSION = 2
 CUDA_PROFILER_CTA_SLOTS = 1
 CUDA_PROFILER_TASK_SLOTS = 12
 CUDA_PROFILER_PER_K_SLOTS = 4
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 def allocate_cuda_profiler_buffer(
@@ -121,7 +126,7 @@ def allocate_cuda_profiler_buffer(
     assert max_records > 0, "max_records must be positive"
     num_words = (
         CUDA_PROFILER_HEADER_U64_WORDS
-        + max_records * CUDA_PROFILER_RECORD_U64_WORDS
+        + _ceil_div(max_records, CUDA_PROFILER_RECORDS_PER_U64)
     )
     return torch.empty(num_words, device=device, dtype=torch.uint64)
 
@@ -130,13 +135,9 @@ def cuda_profiler_capacity(profiler_buffer: torch.Tensor) -> int:
     assert profiler_buffer.is_cuda, "profiler_buffer must be a CUDA tensor"
     assert profiler_buffer.dtype == torch.uint64, "profiler_buffer must be torch.uint64"
     assert profiler_buffer.is_contiguous(), "profiler_buffer must be contiguous"
-    payload_words = profiler_buffer.numel() - CUDA_PROFILER_HEADER_U64_WORDS
-    assert payload_words >= 0, "profiler_buffer is smaller than the profiler header"
-    return payload_words // CUDA_PROFILER_RECORD_U64_WORDS
-
-
-def _ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
+    record_words = profiler_buffer.numel() - CUDA_PROFILER_HEADER_U64_WORDS
+    assert record_words >= 0, "profiler_buffer is smaller than the profiler header"
+    return record_words * CUDA_PROFILER_RECORDS_PER_U64
 
 
 def _device_sm_count(device: Optional[Union[torch.device, str, int]] = None) -> int:

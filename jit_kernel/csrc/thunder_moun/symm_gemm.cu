@@ -119,10 +119,7 @@ void hopper_symm_gemm_kernel_entry(
     const int profiler_k_tiles_total = CEILDIV(K, K_BLOCK_K);
     const int profiler_k_tiles_per_slice = CEILDIV(profiler_k_tiles_total, gridDim.x);
     FFJK_PROFILER_DEFINE_LAYOUT(total_symmetric_tiles, profiler_k_tiles_per_slice);
-    FFJK_PROF_CTA_EVENT_PAYLOAD(
-        ffjk::kProfilerEventKernelLaunch,
-        M,
-        N);
+    FFJK_PROF_CTA_EVENT(ffjk::kProfilerEventKernelLaunch);
 #endif
 
     xpu::HopperWGMMAAccumulator<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K> accumulator_fragment;

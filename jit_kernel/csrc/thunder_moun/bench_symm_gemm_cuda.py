@@ -15,8 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from jit_kernel.thunder_moun import (  # noqa: E402
+    CUDA_PROFILER_FORMAT_VERSION,
     CUDA_PROFILER_HEADER_U64_WORDS,
-    CUDA_PROFILER_RECORD_U64_WORDS,
+    CUDA_PROFILER_RECORDS_PER_U64,
     allocate_cuda_profiler_buffer,
     estimate_cuda_profiler_records,
     symm_gemm_block_scaled,
@@ -41,6 +42,34 @@ EVENT_NAMES = {
     43: "in_place_transpose",
     44: "store_mirror",
 }
+
+CTA_SLOT_EVENTS = (
+    (1, EVENT_KIND_INSTANT),
+)
+
+TASK_SLOT_EVENTS = (
+    (20, EVENT_KIND_BEGIN),
+    (20, EVENT_KIND_END),
+    (21, EVENT_KIND_BEGIN),
+    (21, EVENT_KIND_END),
+    (40, EVENT_KIND_BEGIN),
+    (40, EVENT_KIND_END),
+    (42, EVENT_KIND_BEGIN),
+    (42, EVENT_KIND_END),
+    (43, EVENT_KIND_BEGIN),
+    (43, EVENT_KIND_END),
+    (44, EVENT_KIND_BEGIN),
+    (44, EVENT_KIND_END),
+)
+
+K_SLOT_EVENTS = (
+    (30, EVENT_KIND_BEGIN),
+    (30, EVENT_KIND_END),
+    (31, EVENT_KIND_BEGIN),
+    (31, EVENT_KIND_END),
+)
+
+TIMESTAMP_MASK = (1 << 32) - 1
 
 
 def ceil_div(x: int, y: int) -> int:
@@ -108,6 +137,29 @@ def _u16_hi(value: int) -> int:
     return (value >> 16) & 0xFFFF
 
 
+def _unwrap_profiler_timestamps(records: List[Dict[str, int]]) -> None:
+    if not records:
+        return
+
+    timestamps = sorted({record["timestamp_raw"] for record in records})
+    if len(timestamps) == 1:
+        base_timestamp = timestamps[0]
+    else:
+        largest_gap = -1
+        base_timestamp = timestamps[0]
+        for i, timestamp in enumerate(timestamps):
+            next_timestamp = timestamps[(i + 1) % len(timestamps)]
+            gap = (next_timestamp - timestamp) & TIMESTAMP_MASK
+            if gap > largest_gap:
+                largest_gap = gap
+                base_timestamp = next_timestamp
+
+    for record in records:
+        record["timestamp"] = (
+            record["timestamp_raw"] - base_timestamp
+        ) & TIMESTAMP_MASK
+
+
 def decode_profiler_records(
     profiler_buffer: torch.Tensor,
 ) -> Tuple[Dict[str, Any], List[Dict[str, int]]]:
@@ -122,6 +174,7 @@ def decode_profiler_records(
     grid_xy = _u32_hi(header_word0)
     grid_x = _u16_lo(grid_xy)
     grid_y = _u16_hi(grid_xy)
+    cta_slots_word = _u32_lo(header_word3)
     header = {
         "capacity": _u32_lo(header_word0),
         "grid_x": grid_x,
@@ -131,40 +184,46 @@ def decode_profiler_records(
         "records_per_task": _u32_hi(header_word1),
         "max_tasks_per_cta": _u32_lo(header_word2),
         "max_k_tiles_per_task": _u32_hi(header_word2),
-        "cta_slots": _u32_lo(header_word3),
+        "format_version": _u16_hi(cta_slots_word),
+        "cta_slots": _u16_lo(cta_slots_word),
         "per_k_slots": _u32_hi(header_word3),
     }
+    if header["format_version"] != CUDA_PROFILER_FORMAT_VERSION:
+        raise ValueError(
+            "unsupported profiler format version: "
+            f"{header['format_version']} (expected {CUDA_PROFILER_FORMAT_VERSION})"
+        )
     header["required_capacity"] = header["num_ctas"] * header["records_per_cta"]
     header["static_slots"] = (
         header["records_per_task"]
         - header["max_k_tiles_per_task"] * header["per_k_slots"]
     )
+    if header["cta_slots"] != len(CTA_SLOT_EVENTS):
+        raise ValueError("unsupported profiler CTA-slot layout")
+    if header["static_slots"] != len(TASK_SLOT_EVENTS):
+        raise ValueError("unsupported profiler task-slot layout")
+    if header["per_k_slots"] != len(K_SLOT_EVENTS):
+        raise ValueError("unsupported profiler K-slot layout")
 
     record_count = min(header["capacity"], header["required_capacity"])
     record_offset = CUDA_PROFILER_HEADER_U64_WORDS
+    record_word_count = ceil_div(record_count, CUDA_PROFILER_RECORDS_PER_U64)
     record_words = words[
-        record_offset : record_offset + record_count * CUDA_PROFILER_RECORD_U64_WORDS
+        record_offset : record_offset + record_word_count
     ]
+    if len(record_words) != record_word_count:
+        raise ValueError("profiler buffer is smaller than its declared capacity")
 
     records = []
     empty_slots = 0
     for slot_idx in range(record_count):
-        i = slot_idx * CUDA_PROFILER_RECORD_U64_WORDS
-        word0, word1 = record_words[i : i + CUDA_PROFILER_RECORD_U64_WORDS]
-        if word0 == 0 and word1 == 0:
+        packed_word = record_words[slot_idx // CUDA_PROFILER_RECORDS_PER_U64]
+        word_shift = 32 * (slot_idx % CUDA_PROFILER_RECORDS_PER_U64)
+        timestamp = (packed_word >> word_shift) & TIMESTAMP_MASK
+        if timestamp == 0:
             empty_slots += 1
             continue
 
-        payload = _u32_lo(word1)
-        tag = (word1 >> 32) & 0xFFFF
-        smid = (word1 >> 48) & 0xFFFF
-        event_id = tag & 0xFF
-        if event_id == 0:
-            empty_slots += 1
-            continue
-
-        kind = (tag >> 8) & 0x3
-        flags = (tag >> 10) & 0x3F
         cta_id = slot_idx // header["records_per_cta"]
         slot_in_cta = slot_idx % header["records_per_cta"]
         block_x = cta_id % header["grid_x"] if header["grid_x"] else 0
@@ -189,12 +248,19 @@ def decode_profiler_records(
                 k_iter = k_region // header["per_k_slots"]
                 event_slot = k_region % header["per_k_slots"]
 
+        if slot_scope == "cta":
+            event_id, kind = CTA_SLOT_EVENTS[event_slot]
+        elif slot_scope == "task":
+            event_id, kind = TASK_SLOT_EVENTS[event_slot]
+        else:
+            event_id, kind = K_SLOT_EVENTS[event_slot]
+
         records.append(
             {
-                "timestamp": word0,
+                "timestamp_raw": timestamp,
+                "timestamp": timestamp,
                 "event_id": event_id,
                 "kind": kind,
-                "flags": flags,
                 "cta_id": cta_id,
                 "block_x": block_x,
                 "block_y": block_y,
@@ -208,11 +274,10 @@ def decode_profiler_records(
                 "slot_scope": slot_scope,
                 "event_slot": event_slot,
                 "thread_id": 0,
-                "sm_id": smid,
-                "payload": payload,
             }
         )
 
+    _unwrap_profiler_timestamps(records)
     header["slots_scanned"] = record_count
     header["empty_slots"] = empty_slots
     header["unused_capacity"] = max(0, header["capacity"] - record_count)
@@ -264,7 +329,6 @@ def build_profiler_report(profiler_buffer: torch.Tensor) -> Dict[str, Any]:
             record["cta_id"],
             record["task_iter"],
             record["k_iter"],
-            record["sm_id"],
         )
 
         if record["kind"] == EVENT_KIND_BEGIN:
@@ -321,11 +385,11 @@ def _record_label(record: Dict[str, int]) -> str:
     if record["slot_scope"] == "k":
         return (
             f"cta={record['cta_id']} task={record['task_iter']} "
-            f"k={record['k_iter']} sm={record['sm_id']}"
+            f"k={record['k_iter']}"
         )
     if record["slot_scope"] == "task":
-        return f"cta={record['cta_id']} task={record['task_iter']} sm={record['sm_id']}"
-    return f"cta={record['cta_id']} sm={record['sm_id']}"
+        return f"cta={record['cta_id']} task={record['task_iter']}"
+    return f"cta={record['cta_id']}"
 
 
 def _trace_thread_id(record: Dict[str, int], lane_mode: str) -> str:
@@ -382,8 +446,6 @@ def export_chrome_trace(
             "task_iter": record["task_iter"],
             "task_id": record["task_id"],
             "k_iter": record["k_iter"],
-            "sm_id": record["sm_id"],
-            "payload": record["payload"],
             "scope": record["slot_scope"],
             "slot": record["event_slot"],
         }
@@ -393,7 +455,6 @@ def export_chrome_trace(
             record["cta_id"],
             record["task_iter"],
             record["k_iter"],
-            record["sm_id"],
         )
         if record["kind"] == EVENT_KIND_BEGIN:
             open_events[key].append(record)
@@ -403,8 +464,6 @@ def export_chrome_trace(
             begin = open_events[key].pop()
             begin_ts_us = (begin["timestamp"] - base_ts) / 1000.0
             dur_us = max(0.0, (record["timestamp"] - begin["timestamp"]) / 1000.0)
-            args["begin_payload"] = begin["payload"]
-            args["end_payload"] = record["payload"]
             trace_events.append(
                 {
                     "name": name,
