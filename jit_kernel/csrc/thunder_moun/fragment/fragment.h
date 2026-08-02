@@ -108,23 +108,21 @@ struct FragmentView {
             } // end of sub_frag_idx_n
 
         } // end of sub_frag_idx_m
-        __syncthreads();
+        // __syncthreads();
+
+        //assume blockDim.x == 256
+        const int thr_row = tid >> 4;
+        const int thr_col = tid & 15;
 
         #pragma unroll
         for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
 
-            int sub_frag_idx_m_off = task_idx * FRAG_M;
-            int sub_frag_idx_n_off = task_idx * FRAG_M;
+            if (thr_col < thr_row) {
+                int row_src = task_idx * FRAG_M + thr_row;
+                int col_src = task_idx * FRAG_M + thr_col;
 
-            for (int pair_idx = tid; pair_idx < total_diagonal_pairs; pair_idx += threads_per_block) {
-                int thr_row = static_cast<int>((1 + __fsqrt_rn(1 + 8 * pair_idx)) / 2);
-                int thr_col = pair_idx - (thr_row * (thr_row - 1)) / 2;
-
-                int row_src = sub_frag_idx_m_off + thr_row;
-                int col_src = sub_frag_idx_n_off + thr_col;
-
-                int row_dst = sub_frag_idx_n_off + thr_col;
-                int col_dst = sub_frag_idx_m_off + thr_row;
+                int row_dst = task_idx * FRAG_M + thr_col;
+                int col_dst = task_idx * FRAG_M + thr_row;
 
                 int src_idx, dst_idx;
 
