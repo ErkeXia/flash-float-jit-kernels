@@ -439,7 +439,7 @@ struct HopperPersistentSplitKPipeline {
 
                     // NOTE (yiakwy) : inplace transpose
                     FFJK_PROF_BEGIN(ffjk::kProfilerEventInPlaceTranspose);
-                    frag_view._transpose();
+                    frag_view._transpose_opt();
                     FFJK_PROF_END(ffjk::kProfilerEventInPlaceTranspose);
 #else
                     // NOTE (yiakwy) : outplace transpose

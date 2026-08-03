@@ -4,6 +4,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 #pragma once
 #include <cuda_runtime.h>
+#include <stdint.h>
 
 #ifndef WARP_SIZE
 
@@ -145,6 +146,125 @@ struct FragmentView {
             }
 
         } // end of task_idx
+
+        __syncthreads();
+    }
+
+    __device__ __forceinline__ static uint32_t warp_transpose_8x8_half2(
+        uint32_t packed,
+        int lane_id) {
+        const int out_row = lane_id / 4;
+        const int out_pair = lane_id % 4;
+
+        const int source_pair = out_row / 2;
+        const int half_select = out_row % 2;
+        const int bit_shift = half_select * 16;
+
+        const int source_lane_0 = (2 * out_pair) * 4 + source_pair;
+        const int source_lane_1 = (2 * out_pair + 1) * 4 + source_pair;
+
+        const uint32_t word_0 = __shfl_sync(0xffffffffu, packed, source_lane_0);
+        const uint32_t word_1 = __shfl_sync(0xffffffffu, packed, source_lane_1);
+
+        const uint32_t value_0 = (word_0 >> bit_shift) & 0xffffu;
+        const uint32_t value_1 = (word_1 >> bit_shift) & 0xffffu;
+        return value_0 | (value_1 << 16);
+    }
+
+    // Experimental row-major-only inplace transpose for 16-bit fragments.
+    __device__ inline void _transpose_opt() {
+        static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
+        static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
+        static_assert(BM % 16 == 0, "optimized transpose requires BM to be divisible by 16.");
+
+        constexpr int FRAG_M = 16;
+        constexpr int QUAD_M = 8;
+        constexpr int M_STEPS = BM / FRAG_M;
+        constexpr int TOTAL_OFFDIAGONAL_TILE_PAIRS =
+            M_STEPS * (M_STEPS - 1) / 2;
+
+        const int tid = threadIdx.x;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        const int warp_id = threadIdx.x / WARP_SIZE;
+
+        const int tile_pair_slot = warp_id / 4;
+        const int quadrant = warp_id % 4;
+        const int quad_row = quadrant / 2;
+        const int quad_col = quadrant % 2;
+
+        #pragma unroll
+        for (int pair_base = 0;
+             pair_base < TOTAL_OFFDIAGONAL_TILE_PAIRS;
+             pair_base += 2) {
+            const int tile_pair_idx = pair_base + tile_pair_slot;
+
+            if (tile_pair_idx < TOTAL_OFFDIAGONAL_TILE_PAIRS) {
+                int sub_frag_idx_m = 1;
+
+                #pragma unroll
+                for (int candidate_m = 2; candidate_m < M_STEPS; ++candidate_m) {
+                    if (tile_pair_idx >= candidate_m * (candidate_m - 1) / 2) {
+                        sub_frag_idx_m = candidate_m;
+                    }
+                }
+
+                const int sub_frag_idx_n =
+                    tile_pair_idx - sub_frag_idx_m * (sub_frag_idx_m - 1) / 2;
+
+                const int lower_tile_row = sub_frag_idx_m * FRAG_M;
+                const int lower_tile_col = sub_frag_idx_n * FRAG_M;
+                const int upper_tile_row = sub_frag_idx_n * FRAG_M;
+                const int upper_tile_col = sub_frag_idx_m * FRAG_M;
+
+                const int src_row_base = lower_tile_row + quad_row * QUAD_M;
+                const int src_col_base = lower_tile_col + quad_col * QUAD_M;
+                const int dst_row_base = upper_tile_row + quad_col * QUAD_M;
+                const int dst_col_base = upper_tile_col + quad_row * QUAD_M;
+
+                const int lane_row = lane_id / 4;
+                const int lane_pair = lane_id % 4;
+                const int local_col = 2 * lane_pair;
+
+                const int src_idx =
+                    (src_row_base + lane_row) * BM + src_col_base + local_col;
+                const int dst_idx =
+                    (dst_row_base + lane_row) * BM + dst_col_base + local_col;
+
+                const uint32_t src_old =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
+                const uint32_t dst_old =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + dst_idx);
+
+                const uint32_t src_t = warp_transpose_8x8_half2(src_old, lane_id);
+                const uint32_t dst_t = warp_transpose_8x8_half2(dst_old, lane_id);
+
+                *reinterpret_cast<uint32_t*>(shared_ptr + src_idx) = dst_t;
+                *reinterpret_cast<uint32_t*>(shared_ptr + dst_idx) = src_t;
+            }
+        }
+
+        // Keep the existing row-major algorithm for diagonal 16x16 tiles.
+        const int thr_row = tid >> 4;
+        const int thr_col = tid & 15;
+
+        #pragma unroll
+        for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
+            if (thr_col < thr_row) {
+                const int row_src = task_idx * FRAG_M + thr_row;
+                const int col_src = task_idx * FRAG_M + thr_col;
+                const int row_dst = task_idx * FRAG_M + thr_col;
+                const int col_dst = task_idx * FRAG_M + thr_row;
+
+                const int src_idx = row_src * BM + col_src;
+                const int dst_idx = row_dst * BM + col_dst;
+
+                const T src_val = shared_ptr[src_idx];
+                const T dst_val = shared_ptr[dst_idx];
+
+                shared_ptr[src_idx] = dst_val;
+                shared_ptr[dst_idx] = src_val;
+            }
+        }
 
         __syncthreads();
     }
