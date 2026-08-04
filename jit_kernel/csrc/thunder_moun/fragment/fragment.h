@@ -268,6 +268,90 @@ struct FragmentView {
 
         __syncthreads();
     }
+
+    // Experimental row-major-only transpose using a direct 8x8 tiling.
+    __device__ inline void _transpose_opt_8x8() {
+        constexpr int TILE = 8;
+        constexpr int NUM_TILES = BM / TILE;
+        constexpr int TOTAL_OFFDIAGONAL_TILE_PAIRS =
+            NUM_TILES * (NUM_TILES - 1) / 2;
+        constexpr int WARPS_PER_CTA = 8;
+
+        static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
+        static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
+        static_assert(BM % TILE == 0, "optimized transpose requires BM to be divisible by 8.");
+
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_row = lane_id / 4;
+        const int lane_pair = lane_id % 4;
+        const int local_col = 2 * lane_pair;
+
+        // Each of the eight warps handles one off-diagonal 8x8 tile pair.
+        #pragma unroll
+        for (int pair_base = 0;
+             pair_base < TOTAL_OFFDIAGONAL_TILE_PAIRS;
+             pair_base += WARPS_PER_CTA) {
+            const int tile_pair_idx = pair_base + warp_id;
+
+            if (tile_pair_idx < TOTAL_OFFDIAGONAL_TILE_PAIRS) {
+                int tile_m = 1;
+
+                #pragma unroll
+                for (int candidate_m = 2; candidate_m < NUM_TILES; ++candidate_m) {
+                    if (tile_pair_idx >= candidate_m * (candidate_m - 1) / 2) {
+                        tile_m = candidate_m;
+                    }
+                }
+
+                const int tile_n =
+                    tile_pair_idx - tile_m * (tile_m - 1) / 2;
+
+                const int src_row_base = tile_m * TILE;
+                const int src_col_base = tile_n * TILE;
+                const int dst_row_base = tile_n * TILE;
+                const int dst_col_base = tile_m * TILE;
+
+                const int src_idx =
+                    (src_row_base + lane_row) * BM + src_col_base + local_col;
+                const int dst_idx =
+                    (dst_row_base + lane_row) * BM + dst_col_base + local_col;
+
+                const uint32_t src_old =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
+                const uint32_t dst_old =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + dst_idx);
+
+                const uint32_t src_t = warp_transpose_8x8_half2(src_old, lane_id);
+                const uint32_t dst_t = warp_transpose_8x8_half2(dst_old, lane_id);
+
+                *reinterpret_cast<uint32_t*>(shared_ptr + src_idx) = dst_t;
+                *reinterpret_cast<uint32_t*>(shared_ptr + dst_idx) = src_t;
+            }
+        }
+
+        // The same eight warps transpose the sixteen diagonal 8x8 tiles in two rounds.
+        #pragma unroll
+        for (int tile_base = 0; tile_base < NUM_TILES; tile_base += WARPS_PER_CTA) {
+            const int tile_idx = tile_base + warp_id;
+
+            if (tile_idx < NUM_TILES) {
+                const int row_base = tile_idx * TILE;
+                const int col_base = tile_idx * TILE;
+                const int packed_idx =
+                    (row_base + lane_row) * BM + col_base + local_col;
+
+                const uint32_t old_value =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + packed_idx);
+                const uint32_t transposed =
+                    warp_transpose_8x8_half2(old_value, lane_id);
+
+                *reinterpret_cast<uint32_t*>(shared_ptr + packed_idx) = transposed;
+            }
+        }
+
+        __syncthreads();
+    }
 };
 
 } // namespace xpu
