@@ -407,7 +407,7 @@ struct HopperPersistentSplitKPipeline {
             // become this task's epilogue destination.
             if (split_k_id == 0 && persistent_iteration > 0) {
                 if (threadIdx.x == 0) {
-                    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
                 }
                 __syncthreads();
             }

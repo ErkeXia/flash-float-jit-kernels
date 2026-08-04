@@ -401,7 +401,6 @@ struct FragmentView {
             }
         }
 
-        __syncthreads();
     }
 };
 
