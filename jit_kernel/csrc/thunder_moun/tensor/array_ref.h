@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cuda_runtime.h>
 
-// #include <iterator>
 #include <cstddef>
 #include <type_traits>
 #include <initializer_list>

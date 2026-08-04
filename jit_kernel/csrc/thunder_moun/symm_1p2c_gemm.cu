@@ -90,7 +90,7 @@ constexpr int NUM_WARPS = 12;
 
 constexpr int TOTAL_WARP_THREADS = NUM_WARPS * WARP_SIZE;
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(TOTAL_WARP_THREADS)
 void hopper_symm_gemm_kernel_entry(
     const __nv_fp8_e4m3* __restrict__ X,
     const __nv_fp8_e4m3* __restrict__ W,

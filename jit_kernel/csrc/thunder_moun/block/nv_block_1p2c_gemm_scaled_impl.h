@@ -22,6 +22,7 @@ namespace cg = cooperative_groups;
 
 #include "block.h"
 #include "wasp_producer.h"
+#include "sched.h"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -35,7 +36,7 @@ namespace cg = cooperative_groups;
 
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
-#define USE_CLUSTER_MULTICAST 1
+#define USE_CLUSTER_MULTICAST 0
 
 #define USE_INPALCE_TRI_TRANSPOSE 1
 
@@ -55,15 +56,17 @@ namespace cg = cooperative_groups;
 
 #define CONSUMER_WARPGROUPS (CONSUMER_WARPS / WARP_GROUP) // 2
 
-
-static __device__ __forceinline__ void warpgroup_sync() {
-    asm volatile("barrier.sync 2, 256;\n" ::: "memory");
+// NOTE (yiakwy) : deepgeem uses legacy "bar.sync" which does not support compile time constant.
+template<int num_threads=CONSUMER_THREADS>
+static __device__ __forceinline__ void warpgroup_sync(int barrier_id=7) {
+    // asm volatile("barrier.sync 7, 256;\n" ::: "memory");
+    asm volatile("barrier.sync %0, %1;\n" :: "r"(barrier_id), "n"(num_threads) : "memory");
 }
 
-static __device__ __forceinline__ void warpgroup_sync(int barrier_id) {
-    // asm volatile("barrier.cta.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
-    asm volatile("barrier.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
-}
+// static __device__ __forceinline__ void warpgroup_sync(int barrier_id) {
+//     // NOTE(yiakwy) : barrier.cta.sync
+//     asm volatile("barrier.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
+// }
 
 // TODO (yiakwy) : remove
 static __device__ __forceinline__ uint32_t mapa_shared_cluster(uint32_t local_addr, uint32_t cta_rank) {
@@ -217,6 +220,7 @@ struct HopperPersistentSplitKPipeline {
                 nvgpu::arch::tma_init_barrier<false>(&epilogue_readable_barriers[0], 1);
             }
         }
+        nvgpu::arch::tma_store_fence();
         __syncthreads();
 
 #if USE_CLUSTER_MULTICAST
@@ -252,7 +256,20 @@ struct HopperPersistentSplitKPipeline {
             if ( warp_id == CONSUMER_WARPS && is_leader_thr_in_wgs) {
 
                 while (local_task_id < total_symmetric_tiles) {
+
+                    auto idx = get_block_indices_tri_linear(local_task_id);
+                    int block_idx_m = xpu::get<0>(idx);
+                    int block_idx_n = xpu::get<1>(idx);
+
+                    // Grouping for better L2 cache locality in TMA load
+                    const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
+
+                    get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+
                     // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
+// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+//                     printf("[Producer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : start to filling buffer ... \n", blockIdx.x, blockIdx.y, local_task_id, tid);
+// #endif
 
         #if  USE_CLUSTER_MULTICAST
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
@@ -261,7 +278,7 @@ struct HopperPersistentSplitKPipeline {
                         tma_desc_X, tma_desc_W,
                         shmem_X, shmem_W, barriers, empty_barriers,
                         cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
-                        write_stage/*src & dst*/, tma_phase);
+                        write_stage/*src & dst*/, tma_phase/*src & dst*/);
         #else
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
                         tid, group_id, block_idx_m, block_idx_n,
@@ -269,10 +286,20 @@ struct HopperPersistentSplitKPipeline {
                         tma_desc_X, tma_desc_W,
                         shmem_X, shmem_W, barriers, empty_barriers,
                         cache_hint_lhs, cache_hint_rhs,
-                        write_stage/*src & dst*/, tma_phase);
+                        write_stage/*src & dst*/, tma_phase/*src & dst*/);
         #endif
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    printf("  [Producer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : buffer filled. \n", blockIdx.x, blockIdx.y, local_task_id, tid);
+#endif
+
+                    local_task_id += gridDim.y;
+
                 } // while
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                printf("  [Producer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] :  ===== The Block Finished producing ===== \n", blockIdx.x, blockIdx.y, local_task_id, tid);
+#endif
 
             } // if ( warp_id == CONSUMER_WARPS && is_leader_thr_in_wgs)
 
@@ -284,7 +311,6 @@ struct HopperPersistentSplitKPipeline {
             int tma_phase = 0;
 
             uint32_t epilogue_phase = 0;
-
 
             OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
             FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
@@ -312,6 +338,13 @@ struct HopperPersistentSplitKPipeline {
 
                 get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) prefetching scales ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
+                }
+                warpgroup_sync();
+#endif
+
                 // NOTE (yiakwy) : rows of 1 or more BLOCKS share a scale
                 const int stride_xs_m = K / SCLAE_BLOCK_SIZE_K;
                 const int stride_ws_n = K / SCLAE_BLOCK_SIZE_K;
@@ -336,7 +369,7 @@ struct HopperPersistentSplitKPipeline {
 
                     shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
                 }
-                warpgroup_sync(wg_id);
+                warpgroup_sync();
 
                 // TODO (yiakwy) : remap shmem_WS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
                 #pragma unroll 4
@@ -348,18 +381,28 @@ struct HopperPersistentSplitKPipeline {
 
                     shmem_WS[s_col] = scale_W[g_row * stride_ws_n + g_col];
                 }
-                warpgroup_sync(wg_id);
+                warpgroup_sync();
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
+                }
+                warpgroup_sync();
+
+#endif
 
                 // 2. main loop
                 for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
                     uint32_t current_barrier = __cvta_generic_to_shared(&barriers[read_stage]);
 
-                    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-                    //     printf("[MainLoop] [Split#%d] [SM#%d] block#(%d, %d) k_tile=%d, k_start=%d, k_end=%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, k_tile, k_start, k_end);
-                    // }
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    if (threadIdx.x == 0 && blockIdx.x == 0) {
+                        printf("[Consumer] [MainLoop] [Split#%d] [SM#%d] block#(%d, %d) k_tile=%d, k_start=%d, k_end=%d\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, k_tile, k_start, k_end);
+                    }
+#endif
 
                     if (threadIdx.x == 0) {
-                        // NOTE (yiakwy) : wait parity switch from phase (1 at prfetch stage 0) to ^phase (0 when TMA finish stage 0 transactions)
+                        // NOTE (yiakwy) : wait parity switch from phase ("0" at prfetch stage 0) to ^phase ("1" when TMA finish stage 0 transactions)
                         nvgpu::arch::tma_wait(current_barrier, tma_phase);
                     }
                     warpgroup_sync();
@@ -367,9 +410,11 @@ struct HopperPersistentSplitKPipeline {
                     // TODO (yiakwy) : nvgpu::arch::warpgroup_fence_sync();
                     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 
-                    // if (threadIdx.x == 0 && blockIdx.x == 0 && k_tile == k_end - 1) {
-                    //     printf("[Split#%d/%d] [SM#%d] block#(%d, %d) k_tile=%d, inputs are ready.\n", blockIdx.x, gridDim.x, blockIdx.y, block_idx_m, block_idx_n, k_tile);
-                    // }
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    if (threadIdx.x == 0 && blockIdx.x == 0) {
+                        printf("[Consumer] [Split#%d/%d] [SM#%d] [tid#%d] block#(%d, %d) k_tile=%d, inputs are ready.\n", blockIdx.x, gridDim.x, blockIdx.y, tid, block_idx_m, block_idx_n, k_tile);
+                    }
+#endif
 
                     local_step_accum.clear();
 
@@ -387,13 +432,19 @@ struct HopperPersistentSplitKPipeline {
                         asm volatile(
                             "{\n" ".reg .b64 state; \n"
                             "mbarrier.arrive.shared::cta.b64 state, [%0];\n" "}\n"
-                            :: "r"(bar_addr)
+                            :: "r"(bar_addr) : "memory"
                         );
                     }
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    if (threadIdx.x == 0) {
+                        printf("[Consumer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : Notified the producer that buffer#[%d] is ready to write.\n", blockIdx.x, blockIdx.y, local_task_id, tid, read_stage);
+                    }
+#endif
+
                     local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                     accum.add_(local_step_accum);
-                    warpgroup_sync(wg_id);
+                    warpgroup_sync();
 
                     read_stage = (read_stage + 1) % STAGES;
                     if (read_stage == 0) {
@@ -404,19 +455,33 @@ struct HopperPersistentSplitKPipeline {
                 // 3. Epilogue
                 //   - first write data back to share memory for SPLIT-K reduction via NoC
                 //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
-                accum.store(shmem_epilogue);
-                warpgroup_sync(wg_id);
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    printf("[Epilogue] [Split#%d] [SM#%d] copying acc to shared memory...\n", blockIdx.x, blockIdx.y);
+                }
+#endif
 
-                // if (threadIdx.x == 0 && blockIdx.x == 1) {
-                //     printf("[Epilogue] [Split#%d] [SM#%d] write block <%d, %d> back to shared memory...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-                // }
+                if (threadIdx.x == 0) {
+                    nvgpu::arch::tma_store_wait();
+                }
+                warpgroup_sync<128>(wg_id);
+
+                accum.store(shmem_epilogue);
+                asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
+                warpgroup_sync();
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    printf("[Epilogue] [Split#%d] [SM#%d] Completes copying acc to shmem. Writing local_task_id %d (<%d, %d>) to global ...\n", blockIdx.x, blockIdx.y, local_task_id, block_idx_m, block_idx_n);
+                }
+#endif
 
     #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
                 // if (threadIdx.x == 0 && blockIdx.x == 1) {
                 //     printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
                 // }
 
-                // auto cluster = cooperative_groups::this_cluster();
+                auto cluster = cooperative_groups::this_cluster();
                 // cluster.sync();
 
                 if (split_k > 1) {
@@ -522,6 +587,12 @@ struct HopperPersistentSplitKPipeline {
                     } // split_k_id == 0
                 } //  split_k > 1
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id%d] issuing [Copy 1] ... \n", blockIdx.x, blockIdx.y, local_task_id);
+                }
+#endif
+
                 if (split_k_id == 0) {
                     if (threadIdx.x == 0) {
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
@@ -535,26 +606,55 @@ struct HopperPersistentSplitKPipeline {
                             "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                             : "memory"
                         );
+    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+                        asm volatile("cp.async.bulk.commit_group;");
+    #endif
                     }
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    if (threadIdx.x == 0) {
+                        printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] [Copy 1] issued.\n", blockIdx.x, blockIdx.y, local_task_id);
+                    }
+#endif
 
                     // NOTE (yiakwy) :  transpose copy to upper right
                     if (block_idx_m > block_idx_n) {
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                        if (threadIdx.x == 0) {
+                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] issuing [Inplace Transpose] ...\n", blockIdx.x, blockIdx.y, local_task_id);
+                        }
+#endif
+
     #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                         if (threadIdx.x == 0) {
-                            asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                            // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                            nvgpu::arch::tma_store_wait();
                         }
                         // __syncthreads();
                         warpgroup_sync();
 
                         // NOTE (yiakwy) : inplace transpose
                         frag_view._transpose();
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                        if (threadIdx.x == 0) {
+                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] [Inplace Transpose] issued.\n", blockIdx.x, blockIdx.y, local_task_id);
+                        }
+#endif
+
     #else
                         // NOTE (yiakwy) : outplace transpose
-                        // TODO (yiakwy) : outplace transpose
+                        // TODO (yiakwy) : outplace transpose (TMA transpose store)
     #error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
 
     #endif // USE_INPALCE_TRI_TRANSPOSE
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                        if (threadIdx.x == 0) {
+                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] issuing [Copy 2] ...\n", blockIdx.x, blockIdx.y, local_task_id);
+                        }
+#endif
 
                         if (threadIdx.x == 0) {
     #if SWIZZLE_64B_STORE
@@ -591,13 +691,25 @@ struct HopperPersistentSplitKPipeline {
                                 "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                             );
     #endif // SWIZZLE_64B_STORE
+
+    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+                            asm volatile("cp.async.bulk.commit_group;");
+    #endif
                         }
 
-                        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                        // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                        if (threadIdx.x == 0) {
+                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] [Copy2] issued\n", blockIdx.x, blockIdx.y, local_task_id);
+                        }
+#endif
 
                     } // block_idx_m > block_idx_n
 
                 } // split_id == 0
+
+                // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
                 // cluster.sync();
                 warpgroup_sync();
@@ -642,14 +754,23 @@ struct HopperPersistentSplitKPipeline {
 
                 // fetch next task
                 local_task_id += gridDim.y;
-                warpgroup_sync();
+
+                // warpgroup_sync();
+
+                __syncwarp();
                 // TODO (yiakwy) : check
 
             } // while
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                printf("***** [Epilogue] [Split#%d] [SM#%d] Compelte Writing local_task_id#%d back to global. *****\n", blockIdx.x, blockIdx.y, local_task_id);
+            }
+#endif
+
         } // compute groups
 
-    } //  run_persistent
+    } // run_persistent
 
 };
 

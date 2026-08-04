@@ -5,6 +5,8 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #pragma once
 #include "../tensor/tensor_view_ref.h"
 
+#define DEBUG_BLOCK false
+
 namespace xpu {
 
 template <typename T, int M, int N>

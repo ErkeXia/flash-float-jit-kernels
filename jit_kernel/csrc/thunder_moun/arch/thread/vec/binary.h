@@ -15,8 +15,9 @@ namespace arch {
 
 // SIMD instruction
 
-// NOTE (yiakwy) : there has been a common misunderstanding of NVDIA arch for a long time that NVIDIA GPU is purely SIMD arch,
-// while Hopper and above actually employs a hybrid SIMD/SIMT design for low precision datatypes.
+
+// NOTE (yiakwy) : there has been a common misunderstanding of NVDIA arch for a long time that NVIDIA GPU is purely SIMT arch,
+// however in a matter of the fact, Hopper and above actually employ a hybrid SIMD/SIMT design for low precision datatypes.
 static __device__ __forceinline__ void simd_vadd(half2* dst, const half2* src) {
     #pragma unroll
     for (int i = 0; i < 4; ++i) { // 128-bit = 8x half = 4x half2

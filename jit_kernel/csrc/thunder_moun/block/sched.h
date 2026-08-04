@@ -11,7 +11,6 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include "../tensor/tuple.h"
 #include "../tensor/array_ref.h"
 
-
 // NOTE (yiakwy) : enforce hostside simulation
 #include <cmath>
 #include <cstdint>
@@ -103,10 +102,9 @@ static __host__ __device__ inline xpu::Tuple<int, int> get_block_indices_tri_lin
 #else
 
 #error "Not Supported!"
-    /*
-    static_assert(m > 0);
-    static_assert(m <= MAX_BLOCKS);
-     */
+
+    // static_assert(m > 0);
+    // static_assert(m <= MAX_BLOCKS);
 
     int total_rows = num_blocks_m;
     int row_order[MAX_BLOCKS];
@@ -150,11 +148,10 @@ static __host__ __device__ inline int get_task_id_from_block_indices_tri_linear_
 
     return cumulative + n;
 #else
-    /*
-    static_assert(n > 0);
-    static_assert(n <= m);
-    static_assert(m < num_blocks_m);
-     */
+
+    // static_assert(n > 0);
+    // static_assert(n <= m);
+    // static_assert(m < num_blocks_m);
 
     int total_rows = num_blocks_m;
 

@@ -36,6 +36,15 @@ __device__ __forceinline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arri
     }
 }
 
+template<int Count = 0>
+__device__ __inline__ void tma_store_wait() {
+    asm volatile(
+      "cp.async.bulk.wait_group.read %0;"
+      :
+      : "n"(Count)
+      : "memory");
+}
+
 __device__ __forceinline__ void tma_store_fence();
 
 __device__ __forceinline__ void tma_wait(uint32_t bar, int tma_phase);

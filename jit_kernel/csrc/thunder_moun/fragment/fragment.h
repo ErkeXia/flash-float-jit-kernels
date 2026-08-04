@@ -18,8 +18,8 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #endif
 
 
-static __device__ __forceinline__ void _warpgroup_sync(int barrier_id) {
-  asm volatile("barrier.cta.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
+static __device__ __forceinline__ void _warpgroup_sync(int barrier_id=7) {
+    asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(128) : "memory");
 }
 
 
@@ -48,7 +48,8 @@ struct FragmentView {
         static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
 
         const int tid = threadIdx.x;
-        const int threads_per_block = blockDim.x;
+        int threads_per_block = blockDim.x;
+        threads_per_block = threads_per_block > 256 ? threads_per_block - 128 : threads_per_block; // at least 1 producer
 
         const int lane_id = threadIdx.x % WARP_SIZE;
         const int warp_id = threadIdx.x / WARP_SIZE;

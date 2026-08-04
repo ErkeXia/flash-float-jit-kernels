@@ -7,7 +7,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include "../arch/tma/tma_copy.h"
 #include "../arch/tma/tma_barrier.h"
 
-#include "../arch/warpgroup/reg_allocator.h"
+// #include "../arch/warpgroup/reg_allocator.h"
 
 #include "block.h"
 
@@ -223,8 +223,13 @@ namespace xpu {
             #pragma unroll
             for (int k=k_start; k < k_end; k++) {
 
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : wait for buffer#[%d] to be ready ...\n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+#endif
+
                 // wait for buffers to be ready to write
-                nvgpu::arch::tma_wait(empty_barrieres[write_stage], phase);
+                uint32_t r_bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[write_stage]));
+                nvgpu::arch::tma_wait(r_bar_addr, phase);
 
                 load_once(
                     warpgroups_lane_id, group_id,
@@ -234,6 +239,10 @@ namespace xpu {
                     cache_hint_lhs, cache_hint_rhs,
                     write_stage, phase
                 );
+
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : writing to buffer[%d] ... \n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+#endif
 
                 write_stage = (write_stage + 1) % STAGES;
                 if (write_stage == 0) {
@@ -256,8 +265,13 @@ namespace xpu {
             #pragma unroll
             for (int k=k_start; k < k_end; k++) {
 
+// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+//                 printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : wait for buffer#[%d] to be ready ...\n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+// #endif
+
                 // wait for buffers to be ready to write
-                nvgpu::arch::tma_wait(empty_barrieres[write_stage], phase);
+                uint32_t r_bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[write_stage]));
+                nvgpu::arch::tma_wait(r_bar_addr, phase);
 
                 load_once(
                     warpgroups_lane_id, group_id,
@@ -267,6 +281,10 @@ namespace xpu {
                     cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
                     write_stage, phase
                 );
+
+// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+//                 printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : writing to buffer[%d] ... \n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+// #endif
 
                 write_stage = (write_stage + 1) % STAGES;
                 if (write_stage == 0) {

@@ -24,6 +24,14 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #define WARP_SIZE 32
 #endif
 
+
+// NOTE (yiakwy) : for debug purpose
+// TODO (yiakwy) : remove
+static __device__ __forceinline__ void _warpgroup_sync_256(int barrier_id=7) {
+    asm volatile("barrier.sync %0, %1;\n" :: "r"(barrier_id), "n"(256) : "memory");
+}
+
+
 namespace xpu {
 
 // WGMMA register based fragment accumulator
@@ -115,7 +123,8 @@ struct HopperWGMMAAccumulator {
         const int wg_id = warp_id / WARP_GROUP;
         const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        int wgs = blockDim.x / WARP_GROUP_SIZE;
+        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
@@ -136,7 +145,9 @@ struct HopperWGMMAAccumulator {
     }
 
     __device__ inline void mul_(float scale) {
-        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        int wgs = blockDim.x / WARP_GROUP_SIZE;
+        wgs = wgs > 2 ? wgs - 1 : wgs;
+
         const int M_STEPS = BM / FRAG_M / wgs;
 
         #pragma unroll
@@ -155,7 +166,9 @@ struct HopperWGMMAAccumulator {
         const int wg_id = warp_id / WARP_GROUP;
         const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        int wgs = blockDim.x / WARP_GROUP_SIZE;
+        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+
         const int M_STEPS = BM / FRAG_M / wgs;
 
         float _ws = ws[k_offset];
@@ -175,7 +188,9 @@ struct HopperWGMMAAccumulator {
     }
 
     __device__ inline void add_(const HopperWGMMAAccumulator& b) {
-        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        int wgs = blockDim.x / WARP_GROUP_SIZE;
+        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+
         const int M_STEPS = BM / FRAG_M / wgs;
 
         #pragma unroll
@@ -262,7 +277,8 @@ struct HopperWGMMAExecutor {
         const int wg_id = warp_id / WARP_GROUP;
         // const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        int wgs = blockDim.x / WARP_GROUP_SIZE;
+        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
 
         const int M_STEPS = AccType::BM / FRAG_M / wgs;
 
@@ -279,7 +295,6 @@ struct HopperWGMMAExecutor {
         constexpr uint32_t swizzle_stride_x = 8 * AccType::BK; // 8 * 64 = 512
         constexpr uint32_t swizzle_stride_w = 8 * AccType::BK;
 
-        // 将 smem 局部地址转换为 WGMMA 要求的 64-bit 统一空间描述符
         // NOTE (yiakwy) :
         //   - ref : https://github.com/NVIDIA/cutlass/blob/5f06f5fc1a072bbe4815fae7ae8470b876ed603a/include/cute/arch/mma_sm90_desc.hpp#L108
 
@@ -290,6 +305,11 @@ struct HopperWGMMAExecutor {
         asm volatile(
             "wgmma.fence.sync.aligned;\n" ::: "memory"
         );
+
+        // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        //     printf("[Consumer] [mma_scaled] M_STEPS=%d, N_STEPS=%d, K_STEPS=%d, wgs=%d, blockDim.x=%d, FRAG_M=%d\n", M_STEPS, N_STEPS, K_STEPS, wgs, blockDim.x, FRAG_M);
+        // }
+        // _warpgroup_sync_256();
 
         #pragma unroll
         for (int m_step = 0; m_step < M_STEPS; ++m_step) {
@@ -314,7 +334,7 @@ struct HopperWGMMAExecutor {
                 constexpr uint32_t desc_off = (uint32_t)FRAG_K;
 
                 for (int k_step = 0; k_step < K_STEPS; ++k_step) {
-                    uint32_t addr_x = current_smem_x + k_step * desc_off; // 每个 K 步进对应的字节偏移
+                    uint32_t addr_x = current_smem_x + k_step * desc_off;
                     uint32_t addr_w = current_smem_w + k_step * desc_off;
 
                     /*
@@ -369,7 +389,33 @@ struct HopperWGMMAExecutor {
                         : "l"(desc_x), "l"(desc_w)
                     );
 
+                    // asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+                    // asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+
+                    // // if (threadIdx.x == 255 && blockIdx.x == 1 && blockIdx.y == 2) {
+                    // if (threadIdx.x == 255 && blockIdx.x == 0 && blockIdx.y == 0) {
+                    //     printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] reg[%d ~ %d] = \n", wg_id, m_step, k_step, reg_offset, reg_offset + reg_num_per_frag - 1);
+                    //     for (int i = 0; i < 64; ++i) {
+                    //         printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] RegAcc[%d] = %f \n", wg_id, m_step, k_step, i, reg_ptr[reg_offset + i]);
+                    //     }
+                    //     printf("\n");
+                    // }
+                    // _warpgroup_sync_256();
+
                 } // K_STEPS
+
+                    // asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+                    // asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+
+                    // // if (threadIdx.x == 255 && blockIdx.x == 1 && blockIdx.y == 2) {
+                    // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+                    //     printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] reg[%d ~ %d] = \n", wg_id, m_step, reg_offset, reg_offset + reg_num_per_frag - 1);
+                    //     for (int i = 0; i < 64; ++i) {
+                    //         printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] RegAcc[%d] = %f \n", wg_id, m_step, i, reg_ptr[reg_offset + i]);
+                    //     }
+                    //     printf("\n");
+                    // }
+                    // _warpgroup_sync_256();
 
             } // N_STEPS
 
@@ -378,6 +424,21 @@ struct HopperWGMMAExecutor {
 
     static __device__ inline void commit_and_wait() {
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    }
+
+    // NOTE (yiakwy) : for compilation safety
+    // TODO (yiakwy) : the data dependancy problem (acc and "wgmma.wait_group.sync.aligned 0") has been fixed in compiler, hence the operation should be removed
+    template <typename AccType>
+    static __device__ inline void commit_and_wait(AccType& accum) {
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+
+        float* reg_ptr = accum.get_reg_ptr();
+        uint32_t reg_num_per_frag = AccType::kRegistersPerThread;
+        for (uint32_t i=0; i < reg_num_per_frag; ++i) {
+            asm volatile("" : "+f"(reg_ptr[i]) : : "memory");
+        }
+
         asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     }
 };

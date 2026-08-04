@@ -11,7 +11,6 @@ namespace nvgpu {
 namespace arch {
 
 // NOTE (yiakwy) : TMA bulk 1d copy (cp.async.bulk) via NoC (Dshmem)
-
 static __device__ __forceinline__ void cluster_cp_async_bulk(
     void* dst_local_smem,
     const void* src_remote_smem,
@@ -29,7 +28,6 @@ static __device__ __forceinline__ void cluster_cp_async_bulk(
         : "memory"
     );
 }
-
 
 } // namespace arch
 } // namespace nvgpu

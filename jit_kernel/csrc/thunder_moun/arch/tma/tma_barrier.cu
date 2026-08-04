@@ -34,6 +34,7 @@ __device__ __inline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arrive) {
 
 } // namespace internal
 
+
 __device__ __inline__ void tma_store_fence() {
   asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }

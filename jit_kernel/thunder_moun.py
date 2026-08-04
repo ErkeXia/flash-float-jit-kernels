@@ -25,8 +25,8 @@ from jit_kernel.utils import KERNEL_PATH
 
 extra_ldflags = ["-lcudart", "-lcuda"]
 
-cuda_sources = [
-    str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
+cuda_common_sources = [
+    # str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy.h"),
@@ -36,15 +36,49 @@ cuda_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/block.h"),
-    str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
+    # str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/sched.h"),
-    str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
+    # str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/fragment.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/nv_frag_gemm_scaled_impl.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/array_ref.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/layout.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tuple.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tensor_view_ref.h"),
+]
+
+# cuda_sources = [
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_desc_impl.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_copy_impl.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_barrier.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/tma/tma_barrier.cu"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/arch/cluster/cluster.cu"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/block/block.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/block/sched.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/fragment.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/fragment/nv_frag_gemm_scaled_impl.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/array_ref.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/layout.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tuple.h"),
+#     str(KERNEL_PATH / "csrc" / "thunder_moun/tensor/tensor_view_ref.h"),
+# ]
+
+cuda_wsap_1p2c_impl_sources = [
+    str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
+]
+
+cuda_multi_stage_impl_sources = [
+    str(KERNEL_PATH / "csrc" / "thunder_moun/symm_gemm.cu"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/producer.h"),
+    str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_gemm_scaled_impl.h"),
 ]
 
 _CPP_ENTRY = "symmetric_gemm_fp8_block_scaled"
@@ -64,11 +98,16 @@ if major >= 9:
         "-O2",
         "-Xcompiler",
         "-fPIC",
+        "--ptxas-options=-v",
+        "-Xcudafe",
+        "--diag_suppress=20012",
         "-DENABLE_HOPPER=1",
         "-arch=compute_90a",
         "-code=sm_90a",
         "-I " + str(KERNEL_PATH / "csrc" / "thunder_moun"),
     ]
+
+cuda_sources = cuda_common_sources + cuda_multi_stage_impl_sources
 
 
 @functools.cache
@@ -78,8 +117,29 @@ def _jit_thunder_moun_module():
             "Torch JIT is not supported for thunder moun kernel, please set USE_TORCH_JIT to False"
         )
     else:
-
         cuda_tmp_sources = [f'#include "{path}"' for path in cuda_sources]
+
+        return load_jit(
+            "thunder_moun",
+            cuda_sources=cuda_tmp_sources,
+            # TODO (yiakwy) : add sglang style TVM_FFI warpper
+            # cuda_wrappers=[(_PY_SYMBOL, _CPP_ENTRY)],
+            extra_cuda_cflags=common_cuda_flags,
+            extra_ldflags=extra_ldflags,
+        )
+
+
+cuda_sources_v2 = cuda_common_sources + cuda_wsap_1p2c_impl_sources
+
+
+@functools.cache
+def _jit_thunder_moun_module_v2():
+    if USE_TORCH_JIT:
+        raise Exception(
+            "Torch JIT is not supported for thunder moun kernel, please set USE_TORCH_JIT to False"
+        )
+    else:
+        cuda_tmp_sources = [f'#include "{path}"' for path in cuda_sources_v2]
 
         return load_jit(
             "thunder_moun",
@@ -108,6 +168,7 @@ def symm_gemm_block_scaled(
     SCALE_BLOCK_SIZE_K: int = 128,
     check_input_shape: bool = False,
     use_mxfp8: bool = False,
+    algorithm: str = "multi_stage",
 ) -> torch.Tensor:
     """
     Thunder Moun Optimizer CUDA Kernel
@@ -143,6 +204,11 @@ def symm_gemm_block_scaled(
         if xq.dim() > 2:
             xq = xq.flatten(start_dim=1)
 
+        assert algorithm in [
+            "multi_stage",
+            "wsap_1p2c",
+        ], "algorithm must be either multi_stage or wsap_1p2c"
+
     M, K = xq.shape
     N = wq.shape[0]
 
@@ -154,7 +220,10 @@ def symm_gemm_block_scaled(
     if out is None:
         out = torch.zeros((M, N), device=xq.device, dtype=torch.float16)
 
-    module = _jit_thunder_moun_module()
+    if algorithm == "wsap_1p2c":
+        module = _jit_thunder_moun_module_v2()
+    else:
+        module = _jit_thunder_moun_module()
 
     # print(f"X ptr: {xq.data_ptr()}, Aligned 16B? {xq.data_ptr() % 16 == 0}")
     # print(f"W ptr: {wq.data_ptr()}, Aligned 16B? {wq.data_ptr() % 16 == 0}")
