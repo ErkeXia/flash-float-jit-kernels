@@ -352,6 +352,57 @@ struct FragmentView {
 
         __syncthreads();
     }
+
+    // Experimental row-major-only out-of-place transpose using direct 8x8 tiles.
+    __device__ inline void _transpose_outplace_opt_8x8(T* dst_shared_ptr) const {
+        constexpr int TILE = 8;
+        constexpr int NUM_TILES = BM / TILE;
+        constexpr int TOTAL_TILES = NUM_TILES * NUM_TILES;
+        constexpr int WARPS_PER_CTA = 8;
+
+        static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
+        static_assert(BM == BN, "out-of-place transpose can be only applied to square fragment.");
+        static_assert(BM % TILE == 0, "optimized transpose requires BM to be divisible by 8.");
+
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_row = lane_id / 4;
+        const int lane_pair = lane_id % 4;
+        const int local_col = 2 * lane_pair;
+
+        // Source and destination do not overlap. Each warp therefore handles one
+        // complete 8x8 tile rather than exchanging an off-diagonal tile pair.
+        #pragma unroll
+        for (int tile_base = 0;
+             tile_base < TOTAL_TILES;
+             tile_base += WARPS_PER_CTA) {
+            const int tile_idx = tile_base + warp_id;
+
+            if (tile_idx < TOTAL_TILES) {
+                const int src_tile_row = tile_idx / NUM_TILES;
+                const int src_tile_col = tile_idx % NUM_TILES;
+
+                const int src_row_base = src_tile_row * TILE;
+                const int src_col_base = src_tile_col * TILE;
+                const int dst_row_base = src_tile_col * TILE;
+                const int dst_col_base = src_tile_row * TILE;
+
+                const int src_idx =
+                    (src_row_base + lane_row) * BM + src_col_base + local_col;
+                const int dst_idx =
+                    (dst_row_base + lane_row) * BM + dst_col_base + local_col;
+
+                const uint32_t old_value =
+                    *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
+                const uint32_t transposed =
+                    warp_transpose_8x8_half2(old_value, lane_id);
+
+                *reinterpret_cast<uint32_t*>(dst_shared_ptr + dst_idx) = transposed;
+            }
+        }
+
+        __syncthreads();
+    }
 };
 
 } // namespace xpu

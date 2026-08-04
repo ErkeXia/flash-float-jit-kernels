@@ -85,13 +85,21 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
         // prepare
-        auto* shmem_X = reinterpret_cast<SharedBlock<fp8_t, BM, BK>*>(smem_buffer);
-        auto* shmem_W = reinterpret_cast<SharedBlock<fp8_t, BN, BK>*>(smem_buffer + STAGES * sizeof(*shmem_X));
+        using SharedX = SharedBlock<fp8_t, BM, BK>;
+        using SharedW = SharedBlock<fp8_t, BN, BK>;
+
+#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+        // Keep the original fixed shared-memory layout and FragmentView lifetime
+        // unchanged when the existing in-place path is selected.
+        auto* shmem_X = reinterpret_cast<SharedX*>(smem_buffer);
+        auto* shmem_W = reinterpret_cast<SharedW*>(
+            smem_buffer + STAGES * sizeof(SharedX));
+        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype*>(
+            smem_buffer + STAGES * (sizeof(SharedX) + sizeof(SharedW)));
+        FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
+#endif
 
         int threads_per_block = blockDim.x;
-
-        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
-        FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
         constexpr uint32_t tma_bytes_X = BM * BK;
         constexpr uint32_t tma_bytes_W = BN * BK;
@@ -154,8 +162,34 @@ struct HopperPersistentSplitKPipeline {
         }
         __syncthreads();
 
+        // All CTAs in a cluster start at phase 0 and cross a cluster barrier once
+        // per persistent iteration, so this phase remains cluster-uniform.
+        int persistent_iteration = 0;
+
         while (local_task_id < total_symmetric_tiles) {
             const int task_id = local_task_id;
+
+#if !((defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE)
+            // Five 32 KiB slots form two alternating windows:
+            //   phase 0: X=A+B, W=C+D, epilogue=E, transpose=A
+            //   phase 1: X=B+C, W=D+E, epilogue=A, transpose=E
+            constexpr uint32_t SMEM_SLOT_BYTES = BM * BN * sizeof(OutDtype);
+            static_assert(STAGES * sizeof(SharedX) == 2 * SMEM_SLOT_BYTES,
+                          "out-of-place window requires X stages to occupy two slots.");
+            static_assert(STAGES * sizeof(SharedW) == 2 * SMEM_SLOT_BYTES,
+                          "out-of-place window requires W stages to occupy two slots.");
+
+            const int smem_phase = persistent_iteration & 1;
+            auto* shmem_X = reinterpret_cast<SharedX*>(
+                smem_buffer + smem_phase * SMEM_SLOT_BYTES);
+            auto* shmem_W = reinterpret_cast<SharedW*>(
+                smem_buffer + (2 + smem_phase) * SMEM_SLOT_BYTES);
+            OutDtype* shmem_epilogue = reinterpret_cast<OutDtype*>(
+                smem_buffer + (smem_phase == 0 ? 4 : 0) * SMEM_SLOT_BYTES);
+            OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(
+                smem_buffer + (smem_phase == 0 ? 0 : 4) * SMEM_SLOT_BYTES);
+            FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
+#endif
 
             accum.clear();
 
@@ -368,6 +402,16 @@ struct HopperPersistentSplitKPipeline {
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
+            // The previous task's output TMA stores may overlap this task's
+            // mainloop. Drain them only when their source slot is about to
+            // become this task's epilogue destination.
+            if (split_k_id == 0 && persistent_iteration > 0) {
+                if (threadIdx.x == 0) {
+                    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                }
+                __syncthreads();
+            }
+
             FFJK_PROF_BEGIN(ffjk::kProfilerEventAccumToSmem);
             accum.store(shmem_epilogue);
             __syncthreads();
@@ -409,6 +453,9 @@ struct HopperPersistentSplitKPipeline {
                 }
             } //  split_k > 1
 
+            // Make generic-proxy epilogue writes visible to the async proxy
+            // before thread 0 launches the lower TMA store.
+            nvgpu::arch::tma_store_fence();
             __syncthreads();
 
             if (split_k_id == 0) {
@@ -424,6 +471,7 @@ struct HopperPersistentSplitKPipeline {
                         "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
+                    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
                 }
 
 #if (defined(USE_LINEAR_TO_TRIL_LAYOUT)) && USE_LINEAR_TO_TRIL_LAYOUT
@@ -432,7 +480,9 @@ struct HopperPersistentSplitKPipeline {
 
 #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        // The in-place transpose overwrites the lower store's
+                        // source, so only its shared-memory read must complete.
+                        asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
                     }
                     __syncthreads();
                     FFJK_PROF_END(ffjk::kProfilerEventStoreLower);
@@ -442,11 +492,21 @@ struct HopperPersistentSplitKPipeline {
                     frag_view._transpose_opt();
                     FFJK_PROF_END(ffjk::kProfilerEventInPlaceTranspose);
 #else
-                    // NOTE (yiakwy) : outplace transpose
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+                    // NOTE (yiakwy) : row-major out-of-place transpose. The
+                    // lower TMA store and this transpose may read the epilogue
+                    // concurrently because the transpose writes another slot.
+                    static_assert(SWIZZLE_64B_STORE == 0,
+                                  "out-of-place transpose only supports row-major TMA stores.");
+                    FFJK_PROF_BEGIN(ffjk::kProfilerEventInPlaceTranspose);
+                    frag_view._transpose_outplace_opt_8x8(shmem_transpose);
+                    FFJK_PROF_END(ffjk::kProfilerEventInPlaceTranspose);
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
+
+                    // Make the completed transpose visible to the upper TMA
+                    // store before its issuing thread reaches the instruction.
+                    nvgpu::arch::tma_store_fence();
+                    __syncthreads();
 
                     if (threadIdx.x == 0) {
                         FFJK_PROF_BEGIN(ffjk::kProfilerEventStoreMirror);
@@ -455,25 +515,31 @@ struct HopperPersistentSplitKPipeline {
 #else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
 #endif // SWIZZLE_64B_STORE
-                        uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
+#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+                        OutDtype* shmem_mirror = shmem_epilogue;
+#else
+                        OutDtype* shmem_mirror = shmem_transpose;
+#endif
+                        uint32_t smem_mirror_addr = static_cast<uint32_t>(
+                            __cvta_generic_to_shared(&shmem_mirror[0]));
 
 #if SWIZZLE_64B_STORE
                         asm volatile (
                             "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
                             " [%0, {%2, %3}], [%1];"
                             :
-                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                            : "l"(tma_o_addr), "r"(smem_mirror_addr),
                             "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                             : "memory"
                         );
 
-                        const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
+                        const uint32_t smem_mirror_addr_next = smem_mirror_addr + 128;
 
                         asm volatile (
                             "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
                             " [%0, {%2, %3}], [%1];"
                             :
-                            : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
+                            : "l"(tma_o_addr), "r"(smem_mirror_addr_next),
                                 "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
                             : "memory"
                         );
@@ -482,22 +548,48 @@ struct HopperPersistentSplitKPipeline {
                             "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
                             " [%0, {%2, %3}], [%1];"
                             :
-                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                            : "l"(tma_o_addr), "r"(smem_mirror_addr),
                             "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                             : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
+                        // Keep the upper store in a separate group so the
+                        // out-of-place path can wait for the older lower read
+                        // while leaving this group in flight.
+                        asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
                     }
 
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                     FFJK_PROF_END(ffjk::kProfilerEventStoreMirror);
+
+#if !((defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE)
+                    if (threadIdx.x == 0) {
+                        // Lower is the older group and upper is the newest one.
+                        // Reclaim the lower source for the next mainloop while
+                        // allowing the upper store to remain in flight.
+                        asm volatile("cp.async.bulk.wait_group.read 1;\n" ::: "memory");
+                    }
+                    FFJK_PROF_END(ffjk::kProfilerEventStoreLower);
+#endif
 
                 } // block_idx_m > block_idx_n
                 else {
+#if !((defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE)
+                    if (threadIdx.x == 0) {
+                        // A diagonal task has no upper group, so its sole lower
+                        // group must finish reading before the next phase can
+                        // reuse the epilogue slot as mainloop storage.
+                        asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+                    }
+#endif
                     FFJK_PROF_END(ffjk::kProfilerEventStoreLower);
                 }
 
 #else
+#if !((defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE)
+                if (threadIdx.x == 0) {
+                    asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+                }
+#endif
                 FFJK_PROF_END(ffjk::kProfilerEventStoreLower);
 #endif // USE_LINEAR_TO_TRIL_LAYOUT
 
@@ -548,8 +640,21 @@ struct HopperPersistentSplitKPipeline {
 #ifdef FFJK_ENABLE_CUDA_PROFILER
             ++ffjk_prof_task_iter;
 #endif
+            ++persistent_iteration;
 
         } // while
+
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+        // A final task has no following mainloop/epilogue boundary at which to
+        // drain its output groups. Ensure all global writes are complete before
+        // the issuing CTA returns.
+        if (split_k_id == 0) {
+            if (threadIdx.x == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+            }
+            __syncthreads();
+        }
+#endif
     }
 };
 
