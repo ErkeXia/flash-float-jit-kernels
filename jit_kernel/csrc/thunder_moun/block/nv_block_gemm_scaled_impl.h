@@ -298,7 +298,7 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
+                shmem_XS[s_col * (BM + 1) + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();
 
@@ -369,8 +369,7 @@ struct HopperPersistentSplitKPipeline {
 
                 HopperWGMMAExecutor::commit_and_wait();
 
-                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
-                accum.add_(local_step_accum);
+                accum.fma_scaled_(local_step_accum, &shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 __syncwarp();
 
                 read_stage = (read_stage + 1) % STAGES;
@@ -448,22 +447,23 @@ struct HopperPersistentSplitKPipeline {
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
 
-#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+#if USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
-                        // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                         nvgpu::arch::tma_store_wait();
                     }
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
-                    frag_view._transpose();
+                    frag_view._transpose_opt_8x8();
 
                     if (threadIdx.x == 0) {
+
 #if SWIZZLE_64B_STORE
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
 #else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
 #endif // SWIZZLE_64B_STORE
+
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
 
 #if SWIZZLE_64B_STORE
@@ -499,8 +499,31 @@ struct HopperPersistentSplitKPipeline {
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #else
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+                    static_assert(STAGES * sizeof(*shmem_X) >= BM * BN * sizeof(OutDtype),
+                                "X stage storage is too small for the transpose destination.");
+                    OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(&shmem_X[0]);
+
+                    static_assert(SWIZZLE_64B_STORE == 0,
+                                  "out-of-place transpose only supports row-major TMA stores.");
+                    frag_view._transpose_outplace_opt_8x8(shmem_transpose);
+
+                    if (threadIdx.x == 0) {
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_trans);
+
+                        uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_transpose[0]));
+
+                        asm volatile (
+                            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                            " [%0, {%2, %3}], [%1];"
+                            :
+                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                            "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                        );
+
+                       // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory"); 
+                    } // outplace copy                
+
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
 
