@@ -91,6 +91,13 @@ struct HopperPersistentSplitKPipeline {
         OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
         FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
+#if !USE_INPALCE_TRI_TRANSPOSE
+        // Reuse X-stage storage after the mainloop has consumed every K tile.
+        static_assert(STAGES * sizeof(*shmem_X) >= BM * BN * sizeof(OutDtype),
+                      "X stage storage is too small for the transpose destination.");
+        OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(&shmem_X[0]);
+#endif
+
         constexpr uint32_t tma_bytes_X = BM * BK;
         constexpr uint32_t tma_bytes_W = BN * BK;
 
@@ -99,7 +106,7 @@ struct HopperPersistentSplitKPipeline {
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
-        __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
+        __shared__ __align__(128) float shmem_XS[(BM + 1) * K_TILES_TOTAL]; // avoid bank conflicts
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
@@ -259,7 +266,7 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
+                shmem_XS[s_col * (BM + 1) + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();
 
@@ -330,8 +337,7 @@ struct HopperPersistentSplitKPipeline {
 
                 HopperWGMMAExecutor::commit_and_wait();
 
-                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
-                accum.add_(local_step_accum);
+                accum.fma_scaled_(local_step_accum, &shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 __syncwarp();
 
                 read_stage = (read_stage + 1) % STAGES;
@@ -379,6 +385,10 @@ struct HopperPersistentSplitKPipeline {
                 }
             } //  split_k > 1
 
+#if !USE_INPALCE_TRI_TRANSPOSE
+            // Publish the reduced epilogue tile before the lower TMA store.
+            nvgpu::arch::tma_store_fence();
+#endif
             __syncthreads();
 
             if (split_k_id == 0) {
@@ -394,26 +404,37 @@ struct HopperPersistentSplitKPipeline {
                         "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
+#if !USE_INPALCE_TRI_TRANSPOSE
+                    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#endif
                 }
 
 #if (defined(USE_LINEAR_TO_TRIL_LAYOUT)) && USE_LINEAR_TO_TRIL_LAYOUT
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
 
-#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+#if USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
                         asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                     }
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
-                    frag_view._transpose();
+                    frag_view._transpose_opt_8x8();
 #else
-                    // NOTE (yiakwy) : outplace transpose
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+                    // The lower TMA store and transpose can read shmem_epilogue
+                    // concurrently because the transpose writes shmem_X.
+                    static_assert(SWIZZLE_64B_STORE == 0,
+                                  "out-of-place transpose only supports row-major TMA stores.");
+                    frag_view._transpose_outplace_opt_8x8(shmem_transpose);
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
+
+#if !USE_INPALCE_TRI_TRANSPOSE
+                    // Publish the completed transpose before the upper TMA store.
+                    nvgpu::arch::tma_store_fence();
+                    __syncthreads();
+#endif
 
                     if (threadIdx.x == 0) {
 #if SWIZZLE_64B_STORE
@@ -421,7 +442,11 @@ struct HopperPersistentSplitKPipeline {
 #else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
 #endif // SWIZZLE_64B_STORE
+#if USE_INPALCE_TRI_TRANSPOSE
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
+#else
+                        uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_transpose[0]));
+#endif
 
 #if SWIZZLE_64B_STORE
                         asm volatile (
@@ -453,6 +478,9 @@ struct HopperPersistentSplitKPipeline {
                             : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
+#if !USE_INPALCE_TRI_TRANSPOSE
+                        asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#endif
                     }
 
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -460,6 +488,13 @@ struct HopperPersistentSplitKPipeline {
                 } // block_idx_m > block_idx_n
 
 #endif // USE_LINEAR_TO_TRIL_LAYOUT
+
+#if !USE_INPALCE_TRI_TRANSPOSE
+                if (threadIdx.x == 0) {
+                    // Drain output stores before the next task reuses shmem_X.
+                    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                }
+#endif
 
             } // split_id == 0
             cluster.sync();
