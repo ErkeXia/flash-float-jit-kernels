@@ -5,6 +5,10 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #pragma once
 #include <cuda_runtime.h>
 
+#ifndef CONSUMER_THREADS
+#define CONSUMER_THREADS 256
+#endif
+
 #ifndef WARP_SIZE
 
 #define WARP_SIZE 32
@@ -16,6 +20,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #define SWIZZLE_64B_STORE 0
 
 #endif
+
 
 
 static __device__ __forceinline__ void _warpgroup_sync(int barrier_id=7) {
@@ -48,8 +53,7 @@ struct FragmentView {
         static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
 
         const int tid = threadIdx.x;
-        int threads_per_block = blockDim.x;
-        threads_per_block = threads_per_block > 256 ? threads_per_block - 128 : threads_per_block; // at least 1 producer
+        constexpr int threads_per_block = CONSUMER_THREADS;
 
         const int lane_id = threadIdx.x % WARP_SIZE;
         const int warp_id = threadIdx.x / WARP_SIZE;
@@ -159,7 +163,7 @@ struct FragmentView {
 
         } // end of task_idx
 
-        //__syncthreads();
+        // __syncthreads();
         _warpgroup_sync(wg_id);
 
     }

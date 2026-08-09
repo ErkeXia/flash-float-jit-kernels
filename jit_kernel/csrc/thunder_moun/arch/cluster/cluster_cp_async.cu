@@ -2,7 +2,7 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 
-#include "cp_async.h"
+#include "cluster_cp_async.h"
 
 namespace nvgpu {
 namespace arch {

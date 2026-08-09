@@ -32,17 +32,19 @@ namespace cg = cooperative_groups;
 #define SWIZZLE_64B_STORE 1
 #endif
 
-namespace cg = cooperative_groups;
-
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
 #define USE_CLUSTER_MULTICAST 0
 
 #define USE_INPALCE_TRI_TRANSPOSE 1
 
+#ifndef CONSUMER_THREADS
 #define CONSUMER_THREADS 256
+#endif
 
+#ifndef PRODUCER_THREADS
 #define PRODUCER_THREADS 128
+#endif
 
 #ifndef WARP_GROUP
 #define WARP_GROUP 4
@@ -158,8 +160,6 @@ struct HopperPersistentSplitKPipeline {
         // prepare
         auto* shmem_X = reinterpret_cast<SharedBlock<fp8_t, BM, BK>*>(smem_buffer);
         auto* shmem_W = reinterpret_cast<SharedBlock<fp8_t, BN, BK>*>(smem_buffer + STAGES * sizeof(*shmem_X));
-
-        int threads_per_block = blockDim.x;
 
         // TODO (yiakwy) : move to compute groups
         /*

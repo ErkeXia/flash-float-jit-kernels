@@ -12,6 +12,10 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 #include "fragment.h"
 
+#ifndef CONSUMER_THREADS
+#define CONSUMER_THREADS 256
+#endif
+
 #ifndef WARP_GROUP
 #define WARP_GROUP 4
 #endif
@@ -123,8 +127,7 @@ struct HopperWGMMAAccumulator {
         const int wg_id = warp_id / WARP_GROUP;
         const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        int wgs = blockDim.x / WARP_GROUP_SIZE;
-        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
@@ -145,8 +148,7 @@ struct HopperWGMMAAccumulator {
     }
 
     __device__ inline void mul_(float scale) {
-        int wgs = blockDim.x / WARP_GROUP_SIZE;
-        wgs = wgs > 2 ? wgs - 1 : wgs;
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
@@ -166,8 +168,7 @@ struct HopperWGMMAAccumulator {
         const int wg_id = warp_id / WARP_GROUP;
         const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        int wgs = blockDim.x / WARP_GROUP_SIZE;
-        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
@@ -188,8 +189,7 @@ struct HopperWGMMAAccumulator {
     }
 
     __device__ inline void add_(const HopperWGMMAAccumulator& b) {
-        int wgs = blockDim.x / WARP_GROUP_SIZE;
-        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
         const int M_STEPS = BM / FRAG_M / wgs;
 
@@ -277,8 +277,7 @@ struct HopperWGMMAExecutor {
         const int wg_id = warp_id / WARP_GROUP;
         // const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
 
-        int wgs = blockDim.x / WARP_GROUP_SIZE;
-        wgs = wgs > 2 ? wgs - 1 : wgs; // at least 1 producer
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
         const int M_STEPS = AccType::BM / FRAG_M / wgs;
 

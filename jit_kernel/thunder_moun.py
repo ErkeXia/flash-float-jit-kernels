@@ -98,9 +98,9 @@ if major >= 9:
         "-O2",
         "-Xcompiler",
         "-fPIC",
-        "--ptxas-options=-v",
-        "-Xcudafe",
-        "--diag_suppress=20012",
+        # "--ptxas-options=-v",
+        # "-Xcudafe",
+        # "--diag_suppress=20012",
         "-DENABLE_HOPPER=1",
         "-arch=compute_90a",
         "-code=sm_90a",
@@ -168,7 +168,7 @@ def symm_gemm_block_scaled(
     SCALE_BLOCK_SIZE_K: int = 128,
     check_input_shape: bool = False,
     use_mxfp8: bool = False,
-    algorithm: str = "multi_stage",
+    algorithm: str = "wsap_1p2c",
 ) -> torch.Tensor:
     """
     Thunder Moun Optimizer CUDA Kernel
