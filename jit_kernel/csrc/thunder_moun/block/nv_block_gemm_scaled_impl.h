@@ -92,10 +92,8 @@ struct HopperPersistentSplitKPipeline {
         FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
 #if !USE_INPALCE_TRI_TRANSPOSE
-        // Reuse X-stage storage after the mainloop has consumed every K tile.
-        static_assert(STAGES * sizeof(*shmem_X) >= BM * BN * sizeof(OutDtype),
-                      "X stage storage is too small for the transpose destination.");
-        OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(&shmem_X[0]);
+        // Dedicated out-of-place transpose storage follows the epilogue tile.
+        OutDtype* shmem_transpose = shmem_epilogue + BM * BN;
 #endif
 
         constexpr uint32_t tma_bytes_X = BM * BK;
@@ -491,7 +489,8 @@ struct HopperPersistentSplitKPipeline {
 
 #if !USE_INPALCE_TRI_TRANSPOSE
                 if (threadIdx.x == 0) {
-                    // Drain output stores before the next task reuses shmem_X.
+                    // Drain output stores before a later task reuses the
+                    // dedicated transpose buffer.
                     asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                 }
 #endif

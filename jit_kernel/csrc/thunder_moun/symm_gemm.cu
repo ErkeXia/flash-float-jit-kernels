@@ -332,6 +332,9 @@ extern "C" int symm_gemm_fp8_block_scaled(
     uint32_t required_smem_bytes = sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) * K_STAGES +
                                    sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
                                    sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>);
+#if !USE_INPALCE_TRI_TRANSPOSE
+    required_smem_bytes += sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>);
+#endif
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, required_smem_bytes);
 
