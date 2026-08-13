@@ -19,7 +19,7 @@ void reg_alloc_increase_registers(){
 
 template<uint32_t RegCount>
 static __device__ inline
-void reg_alloc_decrease_registers(){
+void reg_dealloc_decrease_registers(){
     static_assert(RegCount % 8 == 0, "n_reg must be a multiple of 8");
     asm volatile( "setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(RegCount) );
 }

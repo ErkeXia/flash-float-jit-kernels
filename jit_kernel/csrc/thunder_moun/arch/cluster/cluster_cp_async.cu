@@ -2,16 +2,12 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 
-#pragma once
-#include "../tensor/tensor_view_ref.h"
+#include "cluster_cp_async.h"
 
-#define DEBUG_BLOCK false
+namespace nvgpu {
+namespace arch {
 
-namespace xpu {
 
-template <typename T, int M, int N>
-struct alignas(128) SharedBlock {
-    T data[M][N];
-};
 
-} // namespace xpu
+} // namespace arch
+} // namespace nvgpu

@@ -62,7 +62,7 @@ namespace cg = cooperative_groups;
 #include "block/block.h"
 
 // TODO (yiakwy) : move to xpu general interface
-#include "block/nv_block_gemm_scaled_impl.h"
+#include "block/nv_block_1p2c_gemm_scaled_impl.h"
 
 #include "arch/tma/tma_desc.h"
 
@@ -85,11 +85,12 @@ constexpr int CLUSTER_SIZE_M = 2; // GROUP_SIZE_M / 2;
 constexpr int WARP_SIZE = 32;
 #endif
 
-constexpr int NUM_WARPS = 8;
+// WASP wgemm (1p2c) scheme uses 12 warps
+constexpr int NUM_WARPS = 12;
 
 constexpr int TOTAL_WARP_THREADS = NUM_WARPS * WARP_SIZE;
 
-extern "C" __global__
+extern "C" __global__ __launch_bounds__(TOTAL_WARP_THREADS)
 void hopper_symm_gemm_kernel_entry(
     const __nv_fp8_e4m3* __restrict__ X,
     const __nv_fp8_e4m3* __restrict__ W,
@@ -102,64 +103,29 @@ void hopper_symm_gemm_kernel_entry(
     __grid_constant__ const CUtensorMap tma_desc_X,
     __grid_constant__ const CUtensorMap tma_desc_W,
     __grid_constant__ const CUtensorMap tma_desc_O,
-    __grid_constant__ const CUtensorMap tma_desc_O_swizzle)
+    __grid_constant__ const CUtensorMap tma_desc_O_swizzle,
+    __grid_constant__ const CUtensorMap tma_desc_O_trans)
 {
-    // extern __shared__ uint8_t total_smem_space[];
     extern __shared__ __align__(128) uint8_t smem_buffer[];
 
-    /*
-    uintptr_t raw_smem = reinterpret_cast<uintptr_t>(total_smem_space);
-    uintptr_t aligned_smem = (raw_smem + 127) & ~127;
-    uint8_t* smem_buffer = reinterpret_cast<uint8_t*>(aligned_smem);
-    */
-
-    xpu::HopperWGMMAAccumulator<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K> accumulator_fragment;
-    accumulator_fragment.clear();
-
-    // if (threadIdx.x == 0 && blockIdx.x == 1) {
-    //     printf("[hopper_symm_gemm_kernel_entry] [split_k#%d] [SM#%d] enter into HopperPersistentSplitKPipeline ...\n", blockIdx.x, blockIdx.y);
-    // }
-    // __syncthreads();
-
-    if (cluster_size_m < 8) {
-        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 4>::run_persistent(
-            accumulator_fragment,
-            &tma_desc_X,
-            &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
-            scale_X,
-            scale_W,
-            Out, M, N, K,
-            total_symmetric_tiles,
-            num_blocks_m,
-            num_blocks_n,
-            smem_buffer
-        );
-    } else
-    if (cluster_size_m < 4) {
-        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 2>::run_persistent(
-            accumulator_fragment,
-            &tma_desc_X,
-            &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
-            scale_X,
-            scale_W,
-            Out, M, N, K,
-            total_symmetric_tiles,
-            num_blocks_m,
-            num_blocks_n,
-            smem_buffer
-        );
-    } else
-    if (cluster_size_m < 2) {
+    if (cluster_size_m == 1) {
         xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, 1>::run_persistent(
-            accumulator_fragment,
             &tma_desc_X,
             &tma_desc_W,
-            &tma_desc_O,
-            &tma_desc_O_swizzle,
+            &tma_desc_O, &tma_desc_O_swizzle, &tma_desc_O_trans,
+            scale_X,
+            scale_W,
+            Out, M, N, K,
+            total_symmetric_tiles,
+            num_blocks_m,
+            num_blocks_n,
+            smem_buffer
+        );
+    } else {
+        xpu::HopperPersistentSplitKPipeline<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K, K_STAGES, GROUP_SIZE_M, MIN(4, CLUSTER_SIZE_M)>::run_persistent(
+            &tma_desc_X,
+            &tma_desc_W,
+            &tma_desc_O, &tma_desc_O_swizzle, &tma_desc_O_trans,
             scale_X,
             scale_W,
             Out, M, N, K,
@@ -169,7 +135,6 @@ void hopper_symm_gemm_kernel_entry(
             smem_buffer
         );
     }
-
 }
 
 // TVM-FFI raw C interface for JIT kernel invocation
@@ -207,7 +172,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
     CUtensorMap desc_X, desc_W;
-    CUtensorMap desc_O, desc_O_swizzle;
+    CUtensorMap desc_O, desc_O_swizzle, desc_O_trans;
 #else
 
 #error "Compilation Failed: This Flash-Float JIT Kernel relies heavily on Hopper and above hardware features specifically, " \
@@ -303,14 +268,14 @@ extern "C" int symm_gemm_fp8_block_scaled(
         }
     }
 
-    // Optional TMA descriptor for transpose store with swizzle.
+    // Optional TMA descriptor for TMA native transpose store w or w/o swizzle.
     uint32_t box_o_swizzle[2] = {K_BLOCK_N_SWIZZLE, K_BLOCK_M};
     {
         CUresult res = cuTensorMapEncodeTiled(
-            &desc_O_swizzle, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, (fp16_t*)Out_ptr,
+            &desc_O_trans, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, (fp16_t*)Out_ptr,
             shape_o, stride_o, box_o_swizzle, step_o,
             CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B, // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE); // CU_TENSOR_MAP_L2_PROMOTION_L2_256B
 
@@ -321,6 +286,11 @@ extern "C" int symm_gemm_fp8_block_scaled(
             return -1;
         }
     }
+
+    // Optional TMA descriptor for transpose store
+    // TODO (yiakwy) : test and remove
+    desc_O_trans = desc_O;
+
 #else
 
 #error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
@@ -328,7 +298,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 #endif
 
     constexpr int SCLAE_BLOCK_SIZE_K = 128;
-    const int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
+    constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
     auto& kernel = hopper_symm_gemm_kernel_entry;
 
@@ -336,12 +306,6 @@ extern "C" int symm_gemm_fp8_block_scaled(
                                    sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
                                    sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>) +
                                    sizeof(fp32_t) * (K_BLOCK_M * K_TILES_TOTAL + K_TILES_TOTAL);
-
-    /*
-    uint32_t required_smem_bytes = sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) * K_STAGES +
-                                   sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
-                                   sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>);
-     */
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, required_smem_bytes);
 
@@ -397,7 +361,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     cudaError_t state = cudaLaunchKernelEx(&launch_config, kernel,
         (const fp8_t*)X_ptr, (const fp8_t*)W_ptr, (const fp32_t*)scale_X, (fp32_t*)scale_W, (fp16_t*)Out_ptr,
-        M, N, K, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m, desc_X, desc_W, desc_O, desc_O_swizzle
+        M, N, K, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m, desc_X, desc_W, desc_O, desc_O_swizzle, desc_O_trans
     );
 
     if (state != cudaSuccess) {
@@ -407,6 +371,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 #else
 
     // printf("[symm_gemm_fp8_block_scaled] launching stream-split-k kernel with L2 cache...\n");
+
     // launch with L2 cache
 #error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
 

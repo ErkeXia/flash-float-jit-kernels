@@ -22,6 +22,7 @@ namespace cg = cooperative_groups;
 
 #include "block.h"
 #include "producer.h"
+#include "sched.h"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -30,8 +31,6 @@ namespace cg = cooperative_groups;
 #ifndef SWIZZLE_64B_STORE
 #define SWIZZLE_64B_STORE 1
 #endif
-
-namespace cg = cooperative_groups;
 
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
@@ -70,6 +69,29 @@ struct HopperPersistentSplitKPipeline {
         // const int lane_id = threadIdx.x % WARP_SIZE;
         // const int warp_id = threadIdx.x / WARP_SIZE;
 
+        /*
+        if (tid == 0) {
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            }
+
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_W);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            }
+        }
+        __syncwarp();
+        */
+
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
         cluster_rank = nvgpu::arch::cluster_ctarank();
@@ -88,7 +110,8 @@ struct HopperPersistentSplitKPipeline {
 
         int threads_per_block = blockDim.x;
 
-        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
+        int offset = STAGES * (BM * BK + BN * BK);
+        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + offset);
         FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
         constexpr uint32_t tma_bytes_X = BM * BK;
@@ -99,8 +122,14 @@ struct HopperPersistentSplitKPipeline {
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
+        /*
         __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
+         */
+
+        offset += sizeof(OutDtype) * BM * BN;
+        auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
+        auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
@@ -110,7 +139,6 @@ struct HopperPersistentSplitKPipeline {
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int s = 0; s < STAGES; ++s) {
-                uint32_t s_bar_ptr = __cvta_generic_to_shared(&barriers[s]);
                 nvgpu::arch::tma_init_barrier<USE_CLUSTER_MULTICAST>(&barriers[s], 1);
             }
         }
@@ -134,6 +162,7 @@ struct HopperPersistentSplitKPipeline {
             cluster_mask |= (1 << target_rank);
         }
 #endif
+
         const int k_tiles_total = (K + BK - 1) / BK;
 
         int k_tiles_per_slice = (k_tiles_total + split_k - 1) / split_k;
@@ -157,21 +186,20 @@ struct HopperPersistentSplitKPipeline {
             // NOTE (yiakwy) : we only support symmetric gemm, hence force to use linear to triangular mapping for block-level tile assignment.
             // TODO (yiakwy) : precompute the block_idx_m and block_idx_n for each local_task_id and store in shared memory to avoid redundant computation on the fly and reduce the latency.
 #ifdef USE_LINEAR_TO_TRIL_LAYOUT
+            // auto idx = get_block_indices_tri_linear(local_task_id);
+            // int block_idx_m = xpu::get<0>(idx);
+            // int block_idx_n = xpu::get<1>(idx);
+
+            // // Grouping for better L2 cache locality in TMA load
+            // const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
+
+            // get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+
             int block_idx_m = int((sqrt(8.0 * local_task_id + 1.0) - 1.0) / 2.0);
             int block_idx_n = local_task_id - (block_idx_m * (block_idx_m + 1)) / 2;
-#else
-            int block_idx_m = local_task_id / num_blocks_n;
-            int block_idx_n = local_task_id % num_blocks_n;
-#endif
 
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("[pre] [Split#%d] [SM#%d] block#(%d, %d) initiate TAM loading ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-            // }
-
-            // Grouping for better L2 cache locality in TMA load
             const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
 
-            // NOTE (yaikwy) : group swizzle after Down-Left Triangular Mapping for better L2 cache locality in TMA load
             if constexpr (GROUP_SIZE_M > 1) {
                 const uint32_t group_off_row = group_id * GROUP_SIZE_M;
                 const uint32_t group_size_m = min(num_blocks_m - group_off_row, static_cast<uint32_t>(GROUP_SIZE_M));
@@ -204,10 +232,21 @@ struct HopperPersistentSplitKPipeline {
                     block_idx_m = group_off_row + (sub_in_group_id - (group_size_m + c0_plus_1 + 1) * (group_size_m - c0_plus_1) / 2) + c1;
                 }
             }
+#else
+            auto idx = get_block_indices_tri_linear_optimized(local_task_id, num_blocks_m);
+            int block_idx_m = xpu::get<0>(idx);
+            int block_idx_n = xpu::get<1>(idx);
 
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("[after] [Split#%d] [SM#%d] block#(%d, %d) initiate TAM loading ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-            // }
+            // Grouping for better L2 cache locality in TMA load
+            int row_size = num_blocks_m + 1;
+            int group_size = row_size * GROUP_SIZE_M;
+
+            const uint32_t group_id = local_task_id / group_size;
+
+            gaussian_folding_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m, block_idx_n, num_blocks_m);
+
+            static_assert(USE_CLUSTER_MULTICAST == false, "symmetric gemm with Gaussian Folding Swizzle does not support cluster multicast!");
+#endif
 
             int write_stage = 0;
             int read_stage = 0;
@@ -343,7 +382,14 @@ struct HopperPersistentSplitKPipeline {
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
+
+            // if (threadIdx.x == 0) {
+            //     nvgpu::arch::tma_store_wait();
+            // }
+            // __syncthreads();
+
             accum.store(shmem_epilogue);
+            // asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -394,26 +440,23 @@ struct HopperPersistentSplitKPipeline {
                         "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
+    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+                    asm volatile("cp.async.bulk.commit_group;");
+    #endif
                 }
 
-#if (defined(USE_LINEAR_TO_TRIL_LAYOUT)) && USE_LINEAR_TO_TRIL_LAYOUT
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
 
 #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        nvgpu::arch::tma_store_wait();
                     }
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
                     frag_view._transpose();
-#else
-                    // NOTE (yiakwy) : outplace transpose
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
-
-#endif // USE_INPALCE_TRI_TRANSPOSE
 
                     if (threadIdx.x == 0) {
 #if SWIZZLE_64B_STORE
@@ -430,7 +473,6 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
                             "r"(block_idx_n * BN), "r"(block_idx_m * BM)
-                            : "memory"
                         );
 
                         const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
@@ -441,7 +483,6 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
                                 "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
-                            : "memory"
                         );
 #else
                         asm volatile (
@@ -450,16 +491,20 @@ struct HopperPersistentSplitKPipeline {
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
                             "r"(block_idx_m * BN), "r"(block_idx_n * BM)
-                            : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
-                    }
+                        // asm volatile("cp.async.bulk.commit_group;");
+                    } // inplace copy
 
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
-                } // block_idx_m > block_idx_n
+#else
+                    // TODO (yiakwy) : outplace transpose
+#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
 
-#endif // USE_LINEAR_TO_TRIL_LAYOUT
+#endif // USE_INPALCE_TRI_TRANSPOSE
+
+                } // block_idx_m > block_idx_n
 
             } // split_id == 0
             cluster.sync();

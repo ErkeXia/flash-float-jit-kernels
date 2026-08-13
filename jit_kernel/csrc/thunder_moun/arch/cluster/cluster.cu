@@ -2,11 +2,6 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 
-#pragma once
-
-#include <cuda.h>
-#include <cuda_runtime.h>
-
 #include "cluster.h"
 
 namespace nvgpu {
@@ -18,12 +13,21 @@ __device__ inline uint32_t cluster_ctarank() {
     return cluster_rank;
 }
 
+__device__ inline uint32_t cluster_map_shared_rank(uint32_t local_addr, uint32_t cta_rank) {
+    uint32_t mapped;
+    asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(local_addr), "r"(cta_rank));
+    return mapped;
+}
+
 __device__ inline uint32_t cluster_map_shared_rank(void* local_ptr, int target_block_rank) {
     uint32_t local_smem_addr = __cvta_generic_to_shared(local_ptr);
     uint32_t cluster_smem_addr;
-    asm("mapa.shared.u32 %0, %1, %2;\n" : "=r"(cluster_smem_addr) : "r"(local_smem_addr), "r"(target_block_rank));
+
+    cluster_smem_addr = cluster_map_shared_rank(local_smem_addr, target_block_rank);
+
     return cluster_smem_addr;
 }
+
 
 __device__ inline void cluster_arrive() {
     asm volatile("barrier.cluster.arrive.aligned;\n" : : );

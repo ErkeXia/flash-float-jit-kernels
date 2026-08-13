@@ -15,6 +15,8 @@ __device__ __inline__ uint32_t cluster_ctarank();
 // NOTE (yiakwy) : use cluster.map_shared_rank api to resolve the shared memory address from block-level view to cluster-level view.
 __device__ __inline__ uint32_t cluster_map_shared_rank(void* local_ptr, int target_block_rank);
 
+__device__ __inline__ uint32_t cluster_map_shared_rank(uint32_t local_addr, uint32_t cta_rank);
+
 __device__ __inline__ void cluster_arrive();
 
 __device__ __inline__ void cluster_wait();

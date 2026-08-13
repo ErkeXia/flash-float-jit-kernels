@@ -6,6 +6,8 @@
 namespace nvgpu {
 namespace arch {
 
+// NOTE (yiakwy) : we use mbarrier implementation for load to notify consumers the completion
+
 // NOTE (yiakwy) : use TMA multicast and L2 cache hint to optimize the TMA load for weight matrix.
 __device__ __inline__ void tma2d_multicast_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
                                                       uint32_t s_w_mbar_addr, /*mbarrier*/
@@ -57,6 +59,8 @@ __device__ __inline__ void tma2d_load_async(uint32_t smem_addr/*smem dest*/, con
         "r"(inner_dim_offset), "r"(outter_dim_offset), "l"(cache_hint)
     );
 }
+
+// NOTE (yiakwy) : we use async group (.bulk_group) implementation for store to reduce the number of TMA store instructions
 
 __device__ __inline__ void tma2d_store(uint64_t tma_addr/*gmem dest*/, uint32_t smem_epilogue_addr /*smem src*/,
                                        const int32_t inner_dim_offset, const int32_t outter_dim_offset) {

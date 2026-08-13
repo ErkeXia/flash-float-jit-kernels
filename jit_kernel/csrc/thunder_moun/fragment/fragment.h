@@ -5,6 +5,10 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #pragma once
 #include <cuda_runtime.h>
 
+#ifndef CONSUMER_THREADS
+#define CONSUMER_THREADS 256
+#endif
+
 #ifndef WARP_SIZE
 
 #define WARP_SIZE 32
@@ -16,6 +20,13 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #define SWIZZLE_64B_STORE 0
 
 #endif
+
+
+
+static __device__ __forceinline__ void _warpgroup_sync(int barrier_id=7) {
+    asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(128) : "memory");
+}
+
 
 namespace xpu {
 
@@ -42,10 +53,12 @@ struct FragmentView {
         static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
 
         const int tid = threadIdx.x;
-        const int threads_per_block = blockDim.x;
+        constexpr int threads_per_block = CONSUMER_THREADS;
 
         const int lane_id = threadIdx.x % WARP_SIZE;
         const int warp_id = threadIdx.x / WARP_SIZE;
+
+        const int wg_id = warp_id / 4;
 
         constexpr int FRAG_M = 16;
         constexpr int TOTAL_ELEMENTS = BM * BN;
@@ -108,7 +121,9 @@ struct FragmentView {
             } // end of sub_frag_idx_n
 
         } // end of sub_frag_idx_m
-        __syncthreads();
+
+        // __syncthreads();
+        _warpgroup_sync(wg_id);
 
         #pragma unroll
         for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
@@ -148,7 +163,9 @@ struct FragmentView {
 
         } // end of task_idx
 
-        __syncthreads();
+        // __syncthreads();
+        _warpgroup_sync(wg_id);
+
     }
 };
 

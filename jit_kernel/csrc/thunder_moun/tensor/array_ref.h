@@ -15,6 +15,12 @@ limitations under the License.
 
 #pragma once
 
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <type_traits>
+#include <initializer_list>
+
 #include "common.h"
 
 namespace compat {

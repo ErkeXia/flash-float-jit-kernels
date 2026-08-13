@@ -3,15 +3,12 @@ Licensed under the Apache License, Version 2.0 (the "License");
 ==============================================================================*/
 
 #pragma once
-#include "../tensor/tensor_view_ref.h"
 
-#define DEBUG_BLOCK false
+#include <cuda.h>
+#include <cuda_runtime.h>
 
-namespace xpu {
+namespace nvgpu {
+namespace arch {
 
-template <typename T, int M, int N>
-struct alignas(128) SharedBlock {
-    T data[M][N];
-};
-
-} // namespace xpu
+} // namespace arch
+} // namespace nvgpu

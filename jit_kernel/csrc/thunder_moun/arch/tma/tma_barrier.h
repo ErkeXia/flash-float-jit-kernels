@@ -7,6 +7,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+// NOTE (yiakwy)
+// tma/tma_barrier.h defines mbarrier behaviors to cooperate with TMA operations, including barrier initialization, wait, and arrive (tma_expect_bytes) operations.
+
 namespace nvgpu {
 namespace arch {
 
@@ -31,6 +34,15 @@ __device__ __forceinline__ void tma_init_barrier(uint64_t* bar_ptr, int num_arri
     } else {
         internal::tma_init_barrier(bar_ptr, 1);
     }
+}
+
+template<int Count = 0>
+__device__ __inline__ void tma_store_wait() {
+    asm volatile(
+      "cp.async.bulk.wait_group.read %0;"
+      :
+      : "n"(Count)
+      : "memory");
 }
 
 __device__ __forceinline__ void tma_store_fence();
