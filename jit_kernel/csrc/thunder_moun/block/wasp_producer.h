@@ -82,6 +82,8 @@ namespace xpu {
             // The 2d tma instruction needs cluster mask to specify the destination of the multicast
             if (block_idx_n < group_id * GROUP_SIZE_M) {
 
+                // printf("  [Producer#load_multicast_once] [Split#%d] [SM#%d] [tid#%d] : cluster_group_m_rank=%d, block_idx_m=%d, block_idx_n=%d, group_id=%d\n", blockIdx.x, blockIdx.y, threadIdx.x, cluster_group_m_rank, block_idx_m, block_idx_n, group_id);
+
                 nvgpu::arch::tma2d_load_async(
                     smem_x_addr, reinterpret_cast<uint64_t>(tma_desc_X), s_w_bar_ptr,
                     current_k * BK, block_idx_m * BM, cache_hint_lhs
@@ -109,106 +111,6 @@ namespace xpu {
             } // block_idx_n < group_id * GROUP_SIZE_M
 
         }
-
-
-        // static __device__ __inline__ void load(
-        //     const int warpgroups_lane_id, const int group_id, const int block_idx_m, const int block_idx_n,
-        //     const int k_start, const int k_end, const int total_stage_bytes,
-        //     const CUtensorMap* tma_desc_X, const CUtensorMap* tma_desc_W,
-        //     DtypeA* shmem_X, DtypeB* shmem_W, const uint64_t * barriers,
-        //     const uint64_t cache_hint_lhs, const uint64_t cache_hint_rhs,
-        //     int& write_stage/*src & dst*/) {
-
-        //     static_assert(FLIP_TMA_PHASE == false);
-
-        //     int fake_tma_phase = 0;
-        //     load(
-        //         warpgroups_lane_id, group_id, block_idx_m, block_idx_n,
-        //         k_start, k_end, total_stage_bytes,
-        //         tma_desc_X, tma_desc_W,
-        //         shmem_X, shmem_W, barriers,
-        //         cache_hint_lhs, cache_hint_rhs,
-        //         write_stage, fake_tma_phase);
-        // }
-
-        // static __device__ __inline__ void load(
-        //     const int warpgroups_lane_id, const int group_id, const int block_idx_m, const int block_idx_n,
-        //     const int k_start, const int k_end, const int total_stage_bytes,
-        //     const CUtensorMap* tma_desc_X, const CUtensorMap* tma_desc_W,
-        //     DtypeA* shmem_X, DtypeB* shmem_W, const uint64_t * barriers,
-        //     const uint64_t cache_hint_lhs, const uint64_t cache_hint_rhs,
-        //     int& write_stage, int& phase/*dst*/) {
-
-        //     #pragma unroll
-        //     for (int i = 0; i < STAGES - 1; ++i) {
-        //         int current_k = k_start + i;
-        //         if (current_k < k_end) {
-
-        //             load_once(
-        //                 warpgroups_lane_id, group_id,
-        //                 current_k, block_idx_m, block_idx_n, total_stage_bytes,
-        //                 tma_desc_X, tma_desc_W,
-        //                 shmem_X, shmem_W, barriers,
-        //                 cache_hint_lhs, cache_hint_rhs,
-        //                 write_stage, phase
-        //             );
-
-        //         } // current_k < k_end
-
-        //     }
-
-        // }
-
-
-        // // TODO (yiakwy) : move to setup and pass as Arg
-        // // NOTE (yiakwy) : load data with cluster multicast
-        // static __device__ __inline__ void load(
-        //     const int& warpgroups_lane_id, const int& group_id, const int& block_idx_m, const int& block_idx_n,
-        //     const int& k_start, const int& k_end, const int& total_stage_bytes,
-        //     const CUtensorMap* tma_desc_X, const CUtensorMap* tma_desc_W,
-        //     DtypeA* shmem_X, DtypeB* shmem_W, const uint64_t * barriers,
-        //     const uint16_t& cluster_mask, const int& cluster_group_m_rank, const uint64_t& cache_hint_lhs, const uint64_t& cache_hint_rhs,
-        //     int& write_stage/*src & dst*/) {
-
-        //     static_assert(FLIP_TMA_PHASE == false);
-
-        //     int fake_tma_phase = 0;
-        //     load(
-        //         warpgroups_lane_id, group_id, block_idx_m, block_idx_n,
-        //         k_start, k_end, total_stage_bytes,
-        //         tma_desc_X, tma_desc_W,
-        //         shmem_X, shmem_W, barriers,
-        //         cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
-        //         write_stage, fake_tma_phase);
-        // }
-
-        // static __device__ __inline__ void load(
-        //     const int& warpgroups_lane_id, const int& group_id, const int& block_idx_m, const int& block_idx_n,
-        //     const int& k_start, const int& k_end, const int& total_stage_bytes,
-        //     const CUtensorMap* tma_desc_X, const CUtensorMap* tma_desc_W,
-        //     DtypeA* shmem_X, DtypeB* shmem_W, const uint64_t * barriers,
-        //     const uint16_t& cluster_mask, const int& cluster_group_m_rank, const uint64_t& cache_hint_lhs, const uint64_t& cache_hint_rhs,
-        //     int& write_stage/*src & dst*/, int& phase/*dst*/) {
-
-        //     #pragma unroll
-        //     for (int i = 0; i < STAGES - 1; ++i) {
-        //         int current_k = k_start + i;
-        //         if (current_k < k_end) {
-
-        //             load_once(
-        //                 warpgroups_lane_id, group_id,
-        //                 current_k, block_idx_m, block_idx_n, total_stage_bytes,
-        //                 tma_desc_X, tma_desc_W,
-        //                 shmem_X, shmem_W, barriers,
-        //                 cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
-        //                 write_stage, phase
-        //             );
-
-        //         } // current_k < k_end
-
-        //     }
-
-        // }
 
         // === WASP producer ===
 
@@ -266,7 +168,7 @@ namespace xpu {
             for (int k=k_start; k < k_end; k++) {
 
 // #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-//                 printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : wait for buffer#[%d] to be ready ...\n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+//                 printf("  [Producer#load_multicast] [Split#%d] [SM#%d] [tid#%d] : wait for buffer#[%d](write_stage#%d) to be ready ...\n", blockIdx.x, blockIdx.y, threadIdx.x, k, write_stage);
 // #endif
 
                 // wait for buffers to be ready to write
@@ -283,7 +185,7 @@ namespace xpu {
                 );
 
 // #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-//                 printf("  [Producer#load] [Split#%d] [SM#%d] [tid#%d] : writing to buffer[%d] ... \n", blockIdx.x, blockIdx.y, threadIdx.x, k);
+//                 printf("  [Producer#load_multicast] [Split#%d] [SM#%d] [tid#%d] : writing to buffer[%d](write_stage#%d) ... \n", blockIdx.x, blockIdx.y, threadIdx.x, k, write_stage);
 // #endif
 
                 write_stage = (write_stage + 1) % STAGES;

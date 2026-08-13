@@ -110,7 +110,8 @@ struct HopperPersistentSplitKPipeline {
 
         int threads_per_block = blockDim.x;
 
-        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
+        int offset = STAGES * (BM * BK + BN * BK);
+        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + offset);
         FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
         constexpr uint32_t tma_bytes_X = BM * BK;
@@ -121,8 +122,14 @@ struct HopperPersistentSplitKPipeline {
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
+        /*
         __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
+         */
+
+        offset += sizeof(OutDtype) * BM * BN;
+        auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
+        auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
@@ -132,7 +139,6 @@ struct HopperPersistentSplitKPipeline {
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int s = 0; s < STAGES; ++s) {
-                uint32_t s_bar_ptr = __cvta_generic_to_shared(&barriers[s]);
                 nvgpu::arch::tma_init_barrier<USE_CLUSTER_MULTICAST>(&barriers[s], 1);
             }
         }
@@ -376,7 +382,14 @@ struct HopperPersistentSplitKPipeline {
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
+
+            // if (threadIdx.x == 0) {
+            //     nvgpu::arch::tma_store_wait();
+            // }
+            // __syncthreads();
+
             accum.store(shmem_epilogue);
+            // asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -427,6 +440,9 @@ struct HopperPersistentSplitKPipeline {
                         "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
+    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+                    asm volatile("cp.async.bulk.commit_group;");
+    #endif
                 }
 
                 // NOTE (yiakwy) :  transpose copy to upper right
@@ -434,18 +450,13 @@ struct HopperPersistentSplitKPipeline {
 
 #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
-                        asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        nvgpu::arch::tma_store_wait();
                     }
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
                     frag_view._transpose();
-#else
-                    // NOTE (yiakwy) : outplace transpose
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
-
-#endif // USE_INPALCE_TRI_TRANSPOSE
 
                     if (threadIdx.x == 0) {
 #if SWIZZLE_64B_STORE
@@ -482,9 +493,16 @@ struct HopperPersistentSplitKPipeline {
                             "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                         );
 #endif // SWIZZLE_64B_STORE
-                    }
+                        // asm volatile("cp.async.bulk.commit_group;");
+                    } // inplace copy
 
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+#else
+                    // TODO (yiakwy) : outplace transpose
+#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+
+#endif // USE_INPALCE_TRI_TRANSPOSE
 
                 } // block_idx_m > block_idx_n
 

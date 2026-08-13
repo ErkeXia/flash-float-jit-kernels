@@ -34,7 +34,7 @@ namespace cg = cooperative_groups;
 
 #define USE_LINEAR_TO_TRIL_LAYOUT 1
 
-#define USE_CLUSTER_MULTICAST 0
+#define USE_CLUSTER_MULTICAST 1
 
 #define USE_INPALCE_TRI_TRANSPOSE 1
 
@@ -61,14 +61,8 @@ namespace cg = cooperative_groups;
 // NOTE (yiakwy) : deepgeem uses legacy "bar.sync" which does not support compile time constant.
 template<int num_threads=CONSUMER_THREADS>
 static __device__ __forceinline__ void warpgroup_sync(int barrier_id=7) {
-    // asm volatile("barrier.sync 7, 256;\n" ::: "memory");
     asm volatile("barrier.sync %0, %1;\n" :: "r"(barrier_id), "n"(num_threads) : "memory");
 }
-
-// static __device__ __forceinline__ void warpgroup_sync(int barrier_id) {
-//     // NOTE(yiakwy) : barrier.cta.sync
-//     asm volatile("barrier.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
-// }
 
 // TODO (yiakwy) : remove
 static __device__ __forceinline__ uint32_t mapa_shared_cluster(uint32_t local_addr, uint32_t cta_rank) {
@@ -83,6 +77,10 @@ static __device__ __forceinline__ void mbar_arrive_cluster_release(uint64_t* bar
     asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0], 1;" ::"r"(mapped));
 }
 
+namespace nvgpu {
+    namespace arch {
+
+// TODO (yiakwy) : remove
 static __device__ __forceinline__ void cluster_cp_async_bulk(
     void* dst_local_smem,
     const void* src_remote_smem,
@@ -101,12 +99,16 @@ static __device__ __forceinline__ void cluster_cp_async_bulk(
     );
 }
 
+// TODO (yiakwy) : remove
 static __device__ __forceinline__ void simd_vadd(half2* dst, const half2* src) {
     #pragma unroll
     for (int i = 0; i < 4; ++i) { // 128-bit = 8x half = 4x half2
         dst[i] = __hadd2(dst[i], src[i]);
     }
 }
+
+    } // namespace arch
+} //  namespace nvgpu
 
 namespace xpu {
 
@@ -115,11 +117,11 @@ struct HopperPersistentSplitKPipeline {
 
     // sm90+
     static __device__ inline void run_persistent(
-        // HopperWGMMAAccumulator<BM, BN, BK>& accum,
         const CUtensorMap* tma_desc_X,
         const CUtensorMap* tma_desc_W,
         const CUtensorMap* tma_desc_O,
         const CUtensorMap* tma_desc_O_swizzle,
+        const CUtensorMap* tma_desc_O_trans,
         const float* scale_X,
         const float* scale_W,
         half* Out,
@@ -137,6 +139,8 @@ struct HopperPersistentSplitKPipeline {
 
         const int tid = threadIdx.x;
         // const int lane_id = threadIdx.x % WARP_SIZE;
+
+        const int wg_lane_id = tid % 128;
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int wg_id = warp_id / WARP_GROUP;
 
@@ -144,6 +148,27 @@ struct HopperPersistentSplitKPipeline {
         bool is_producer = !is_consumer; // select one warp group
 
         bool is_leader_thr_in_wgs = is_consumer ? (tid == 0) : (tid == CONSUMER_THREADS);
+
+        if (is_producer && is_leader_thr_in_wgs) {
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            } // prefetch tma_desc_X
+
+            {
+                uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_W);
+                asm volatile (
+                    "prefetch.tensormap [%0];"
+                    :
+                    : "l"(gmem_int_desc)
+                    : "memory");
+            } // prefetch tma_desc_W
+        } // prefetch tma_desc_X and tma_desc_W
+        __syncwarp();
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
@@ -161,46 +186,22 @@ struct HopperPersistentSplitKPipeline {
         auto* shmem_X = reinterpret_cast<SharedBlock<fp8_t, BM, BK>*>(smem_buffer);
         auto* shmem_W = reinterpret_cast<SharedBlock<fp8_t, BN, BK>*>(smem_buffer + STAGES * sizeof(*shmem_X));
 
-        // TODO (yiakwy) : move to compute groups
-        /*
-        OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
-        FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
-        */
-
         constexpr uint32_t tma_bytes_X = BM * BK;
         constexpr uint32_t tma_bytes_W = BN * BK;
 
         constexpr uint32_t total_stage_bytes = tma_bytes_X + tma_bytes_W;
 
-        // TODO (yiakwy) : move to compute groups
-        /*
-        constexpr int SCLAE_BLOCK_SIZE_K = 128;
-        constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
-        */
-
-        // TODO (yiakwy) : move to compute groups
-        /*
-        __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
-        __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
-        */
-
-        // TODO (yiakwy) : init full barriers for TMA, in wasp, we have empty barriers to indicate the smem to be writable and full barriers readable
+        // NOTE (yiakwy) : init full barriers for TMA, in wasp, we have empty barriers to indicate the smem to be writable and full barriers readable
         __shared__ __align__(128) uint64_t barriers[STAGES]; // full_barriers
         __shared__ __align__(128) uint64_t empty_barriers[STAGES];
 
-       // TODO (yiakwy) : epilogue barrier for on chip split-k reduction
+        // NOTE (yiakwy) : epilogue barrier for on chip split-k reduction
         __shared__ __align__(128) uint64_t epilogue_barriers[1];
         __shared__ __align__(128) uint64_t epilogue_readable_barriers[1];
-
-        // TODO (yiakwy) : move to compute groups
-        /*
-        __shared__ __align__(128) OutDtype *dst[8];
-        */
 
         if (threadIdx.x == 0) {
             #pragma unroll
             for (int s = 0; s < STAGES; ++s) {
-                uint32_t s_bar_ptr = __cvta_generic_to_shared(&barriers[s]);
                 nvgpu::arch::tma_init_barrier<USE_CLUSTER_MULTICAST>(&barriers[s], 1);
                 nvgpu::arch::tma_init_barrier<USE_CLUSTER_MULTICAST>(&empty_barriers[s], CLUSTER_SIZE_M * CONSUMER_WARPGROUPS);
             }
@@ -267,9 +268,9 @@ struct HopperPersistentSplitKPipeline {
                     get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
 
                     // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
-// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-//                     printf("[Producer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : start to filling buffer ... \n", blockIdx.x, blockIdx.y, local_task_id, tid);
-// #endif
+#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+                    printf("  [Producer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : group_id#%d, start to filling buffer ... \n", blockIdx.x, blockIdx.y, local_task_id, tid, group_id);
+#endif
 
         #if  USE_CLUSTER_MULTICAST
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
@@ -312,14 +313,21 @@ struct HopperPersistentSplitKPipeline {
 
             uint32_t epilogue_phase = 0;
 
-            OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + STAGES * (BM * BK + BN * BK));
+            int offset = STAGES * (BM * BK + BN * BK);
+            OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + offset);
             FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
             constexpr int SCLAE_BLOCK_SIZE_K = 128;
             constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
+            /*
             __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
             __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
+             */
+
+            offset += sizeof(OutDtype) * BM * BN;
+            auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
+            auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
 
             xpu::HopperWGMMAAccumulator<BM, BN, BK> accum;
             xpu::HopperWGMMAAccumulator<BM, BN, BK> local_step_accum;
@@ -340,7 +348,7 @@ struct HopperPersistentSplitKPipeline {
 
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                 if (threadIdx.x == 0 && blockIdx.x == 0) {
-                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) prefetching scales ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
+                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] : block#(%d, %d), group_id#%d prefetching scales ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, group_id);
                 }
                 warpgroup_sync();
 #endif
@@ -383,13 +391,12 @@ struct HopperPersistentSplitKPipeline {
                 }
                 warpgroup_sync();
 
-#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-                if (threadIdx.x == 0 && blockIdx.x == 0) {
-                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-                }
-                warpgroup_sync();
-
-#endif
+// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
+//                 if (threadIdx.x == 0 && blockIdx.x == 0) {
+//                     printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
+//                 }
+//                 warpgroup_sync();
+// #endif
 
                 // 2. main loop
                 for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
@@ -426,6 +433,12 @@ struct HopperPersistentSplitKPipeline {
 
                     HopperWGMMAExecutor::commit_and_wait();
 
+#if USE_CLUSTER_MULTICAST
+                    if (wg_lane_id < CLUSTER_SIZE_M) {
+                        uint32_t target_cta_rank = wg_lane_id;
+                        mbar_arrive_cluster_release(&empty_barriers[read_stage], target_cta_rank);
+                    }
+#else
                     // TODO (yiakwy) : nvgpu::arch::arrive_barrier(empty_barriers[read_stage]);
                     if (threadIdx.x == 0) {
                         uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[read_stage]));
@@ -435,6 +448,7 @@ struct HopperPersistentSplitKPipeline {
                             :: "r"(bar_addr) : "memory"
                         );
                     }
+#endif
 
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                     if (threadIdx.x == 0) {
@@ -477,12 +491,11 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
     #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
-                // if (threadIdx.x == 0 && blockIdx.x == 1) {
-                //     printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
-                // }
+                if (threadIdx.x == 0 && blockIdx.x == 1) {
+                    printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
+                }
 
                 auto cluster = cooperative_groups::this_cluster();
-                // cluster.sync();
 
                 if (split_k > 1) {
                     if (split_k_id > 0) {
@@ -581,7 +594,6 @@ struct HopperPersistentSplitKPipeline {
                             }
                         }
 
-                        // __syncthreads();
                         warpgroup_sync();
 
                     } // split_k_id == 0
@@ -594,6 +606,7 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
                 if (split_k_id == 0) {
+
                     if (threadIdx.x == 0) {
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
@@ -631,38 +644,20 @@ struct HopperPersistentSplitKPipeline {
                             // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                             nvgpu::arch::tma_store_wait();
                         }
-                        // __syncthreads();
                         warpgroup_sync();
 
                         // NOTE (yiakwy) : inplace transpose
                         frag_view._transpose();
 
-#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                         if (threadIdx.x == 0) {
-                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] [Inplace Transpose] issued.\n", blockIdx.x, blockIdx.y, local_task_id);
-                        }
-#endif
 
-    #else
-                        // NOTE (yiakwy) : outplace transpose
-                        // TODO (yiakwy) : outplace transpose (TMA transpose store)
-    #error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
-
-    #endif // USE_INPALCE_TRI_TRANSPOSE
-
-#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-                        if (threadIdx.x == 0) {
-                            printf("[Epilogue] [Split#%d] [SM#%d] [local_task_id#%d] issuing [Copy 2] ...\n", blockIdx.x, blockIdx.y, local_task_id);
-                        }
-#endif
-
-                        if (threadIdx.x == 0) {
     #if SWIZZLE_64B_STORE
                             uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
     #else
                             uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
     #endif // SWIZZLE_64B_STORE
-                            uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
+
+                            uint32_t smem_epilogue_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
 
     #if SWIZZLE_64B_STORE
                             asm volatile (
@@ -691,13 +686,30 @@ struct HopperPersistentSplitKPipeline {
                                 "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                             );
     #endif // SWIZZLE_64B_STORE
-
-    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                             asm volatile("cp.async.bulk.commit_group;");
-    #endif
-                        }
+                        } // inplace copy
 
-                        // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    #else
+                        // NOTE (yiakwy) : outplace transpose
+                        if (threadIdx.x == 0) {
+                            // outplace transpose copy
+
+                            uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_trans);
+
+                            uint32_t smem_epilogue_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
+
+                            asm volatile (
+                                "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                                " [%0, {%2, %3}], [%1];"
+                                :
+                                : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                                "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            );
+
+                        } // outplace copy
+
+                        asm volatile("cp.async.bulk.commit_group;");
+    #endif // USE_INPALCE_TRI_TRANSPOSE
 
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                         if (threadIdx.x == 0) {
@@ -709,9 +721,6 @@ struct HopperPersistentSplitKPipeline {
 
                 } // split_id == 0
 
-                // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-
-                // cluster.sync();
                 warpgroup_sync();
 
     #else
@@ -748,17 +757,12 @@ struct HopperPersistentSplitKPipeline {
                     } // end of tranpose copy to upper right
                 }
                 __syncwarp();
-                // TODO (yiakwy) : check
 
     #endif // __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
 
                 // fetch next task
                 local_task_id += gridDim.y;
-
-                // warpgroup_sync();
-
                 __syncwarp();
-                // TODO (yiakwy) : check
 
             } // while
 
