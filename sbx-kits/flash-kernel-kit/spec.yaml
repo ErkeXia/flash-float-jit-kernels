@@ -1,0 +1,104 @@
+schemaVersion: "1"
+kind: mixin
+name: flash-kernel-kit
+displayName: Flash Float GPU Kernel Dev
+description: >
+  Pre-installs PyTorch, CUDA toolkit, Triton, and kernel dev tools
+  for flash-float-jit-kernels development. Also installs the
+  kernel agent dependencies (safety harness, SOL calculator, etc).
+
+caps:
+  network:
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - download.pytorch.org
+      - github.com
+      - objects.githubusercontent.com
+
+commands:
+  install:
+    # Python venv tooling
+    - command: "pip install --upgrade pip setuptools wheel"
+      user: "1000"
+      description: Upgrade pip and build tools
+
+    # PyTorch with CUDA
+    - command: "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124"
+      user: "1000"
+      description: Install PyTorch with CUDA 12.4
+
+    # Triton 3.4
+    - command: "pip install triton"
+      user: "1000"
+      description: Install Triton
+
+    # Core deps for flash-float-jit-kernels
+    - command: "pip install numpy packaging setuptools-scm"
+      user: "1000"
+      description: Install core dependencies
+
+    # Benchmarking deps
+    - command: "pip install sglang"
+      user: "1000"
+      description: Install SGLang for TopK benchmarks
+
+    # opencode CLI for headless server
+    - command: "npm install -g opencode-ai || curl -fsSL https://opencode.ai/install | bash"
+      user: "1000"
+      description: Install opencode CLI
+
+  startup:
+    - command: ["bash", "-c", "nvidia-smi 2>/dev/null || echo 'No GPU detected -- running in CPU/dry-run mode'"]
+      description: Show GPU info on start
+    - command: ["bash", "-c", "pip list 2>/dev/null | grep -E 'torch|triton' || echo 'Packages not yet installed'"]
+      description: Verify installed packages
+    - command: ["bash", "-c", "which opencode 2>/dev/null && opencode --version || echo 'opencode not installed'"]
+      description: Verify opencode is available
+
+environment:
+  variables:
+    TORCH_CUDA_ARCH_LIST: "9.0"
+
+ports:
+  - "8096:8096"
+
+agentContext: |
+  ## GPU Kernel Development Environment
+
+  You are working in the flash-float-jit-kernels repository.
+
+  **Available tools:**
+  - `python` — Python 3 with PyTorch, Triton, and CUDA support
+  - `nvidia-smi` — Check GPU status
+  - `nvcc` — CUDA compiler (if GPU present)
+  - `opencode` — Headless AI coding agent (use `opencode serve --port 8096`)
+
+  **Key commands:**
+  - `python tools/kernel_agent.py harness --kernel <path>`
+    Run 5-stage safety harness on a kernel
+  - `python tools/kernel_agent.py benchmark --kernel <path>`
+    Benchmark a kernel and report SOL gap
+  - `python tools/kernel_agent.py serve --port 8096`
+    Start opencode headless server for the kernel agent orchestrator
+  - `python tools/kernel_agent.py run --kernel <path> --max-iter 10`
+    Full optimization loop (write -> verify -> bench -> keep/revert)
+
+  **Repository layout:**
+  - `jit_kernel/csrc/` — CUDA kernels (.cu files)
+  - `jit_kernel/triton3_4/` — Triton kernels (.py files)
+  - `tools/` — Kernel agent orchestrator, opencode client, benchmarks
+  - `benchmark/` — Benchmarking scripts
+  - `.opencode/skills/` — Hopper, CUDA, Triton, Metal kernel skills
+
+  **Before claiming a kernel is correct, always run:**
+  1. Smoke test (small input)
+  2. Shape sweep (multiple sizes)
+  3. Stability check (extreme values)
+  4. Determinism check (same output x3)
+  5. Edge cases (non-power-of-2 dimensions)
+
+  **Never cheat:**
+  - Don't hardcode outputs
+  - Don't skip computation steps
+  - Don't use view/as_strided instead of real data movement
