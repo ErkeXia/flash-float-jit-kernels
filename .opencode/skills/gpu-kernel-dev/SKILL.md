@@ -10,8 +10,8 @@ description: General GPU kernel development skill covering profiling, benchmarki
 ### Memory Hierarchy (fastest to slowest)
 - **Registers**: Private per-thread (~256 per thread). Extremely fast, tiny.
 - **Shared Memory (SMEM)**: Shared by thread block (~48-228 KB). Use for data reuse.
-- **L2 Cache**: Shared across SMs (~50 MB on H100). Automatic but unpredictable.
-- **Global Memory (HBM)**: Main GPU RAM (80 GB H100). ~100x slower than shared memory.
+- **L2 Cache**: Shared across SMs (~50 MB on H100/H800). Automatic but unpredictable.
+- **Global Memory (HBM)**: Main GPU RAM (80 GB H100/H800). ~100x slower than shared memory.
 
 ### Performance Metrics
 - **Arithmetic Intensity** = FLOPs / Bytes moved. High = compute-bound, low = memory-bound.

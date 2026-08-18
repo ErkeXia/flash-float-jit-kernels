@@ -1,7 +1,7 @@
 ---
 description: Specialized agent for GPU kernel development. Generates, optimizes, and debugs CUDA, Triton, and Metal kernels. Follows a measure-analyze-implement-verify loop with correctness gating and SOL (Speed-of-Light) performance analysis.
 mode: subagent
-model: anthropic/claude-sonnet-4-6
+model: opencode/deepseek-v4-flash-free
 permission:
   edit: allow
   bash: allow
@@ -69,6 +69,8 @@ Any failure = reject the candidate immediately.
 - If a kernel is faster than the SOL bound, it's cheating — flag it
 
 ## Reference Performance
-- H100 peak: 989.5 TFLOPS (FP16 tensor), 3,352 GB/s (HBM3)
+- Target platform: H800 SuperPod with IB9700 (NDR 400G InfiniBand) interconnect
+- H800 SXM peak: 989.5 TFLOPS (FP16 tensor, dense), 3,352 GB/s (HBM3)
+- **NVLink is only 400 GB/s on H800 (H100 has 900 GB/s)** — multi-GPU kernels must not rely on high NVLink bandwidth; prefer cross-node IB9700 communication for cluster-scale workloads
 - Apple M3 Ultra: ~70 TFLOPS (FP16), ~800 GB/s (unified memory)
 - Always verify against published GPU specs

@@ -23,9 +23,9 @@
   "permission": {
     "edit": "allow",
     "bash": {
-      "git *": "allow",
+      "git *": "ask",
       "nvidia-smi": "allow",
-      "python*": "allow",
+      "python*": "ask",
       "nvcc*": "allow",
       "cmake*": "allow",
       "pip*": "allow",

@@ -43,15 +43,25 @@ commands:
       user: "1000"
       description: Install SGLang for TopK benchmarks
 
+    # opencode CLI for headless server
+    - command: "npm install -g opencode-ai || curl -fsSL https://opencode.ai/install | bash"
+      user: "1000"
+      description: Install opencode CLI
+
   startup:
     - command: ["bash", "-c", "nvidia-smi 2>/dev/null || echo 'No GPU detected -- running in CPU/dry-run mode'"]
       description: Show GPU info on start
     - command: ["bash", "-c", "pip list 2>/dev/null | grep -E 'torch|triton' || echo 'Packages not yet installed'"]
       description: Verify installed packages
+    - command: ["bash", "-c", "which opencode 2>/dev/null && opencode --version || echo 'opencode not installed'"]
+      description: Verify opencode is available
 
 environment:
   variables:
     TORCH_CUDA_ARCH_LIST: "9.0"
+
+ports:
+  - "8096:8096"
 
 agentContext: |
   ## GPU Kernel Development Environment
@@ -62,26 +72,30 @@ agentContext: |
   - `python` — Python 3 with PyTorch, Triton, and CUDA support
   - `nvidia-smi` — Check GPU status
   - `nvcc` — CUDA compiler (if GPU present)
+  - `opencode` — Headless AI coding agent (use `opencode serve --port 8096`)
 
   **Key commands:**
-  - `python tools/kernel_agent.py --kernel-file <path> --gpu h100 --dry-run`
-    Run safety harness without GPU
-  - `python tools/kernel_agent.py --kernel-file <path> --gpu h100 --max-iterations 40`
-    Full optimization loop
-  - `python tools/sanity_check.py`
-    Verify everything is set up correctly
+  - `python tools/kernel_agent.py harness --kernel <path>`
+    Run 5-stage safety harness on a kernel
+  - `python tools/kernel_agent.py benchmark --kernel <path>`
+    Benchmark a kernel and report SOL gap
+  - `python tools/kernel_agent.py serve --port 8096`
+    Start opencode headless server for the kernel agent orchestrator
+  - `python tools/kernel_agent.py run --kernel <path> --max-iter 10`
+    Full optimization loop (write -> verify -> bench -> keep/revert)
 
   **Repository layout:**
   - `jit_kernel/csrc/` — CUDA kernels (.cu files)
   - `jit_kernel/triton3_4/` — Triton kernels (.py files)
-  - `tools/` — Agent loop, Modal runner, sanity checks
+  - `tools/` — Kernel agent orchestrator, opencode client, benchmarks
   - `benchmark/` — Benchmarking scripts
+  - `.opencode/skills/` — Hopper, CUDA, Triton, Metal kernel skills
 
   **Before claiming a kernel is correct, always run:**
   1. Smoke test (small input)
   2. Shape sweep (multiple sizes)
   3. Stability check (extreme values)
-  4. Determinism check (same output ×3)
+  4. Determinism check (same output x3)
   5. Edge cases (non-power-of-2 dimensions)
 
   **Never cheat:**
