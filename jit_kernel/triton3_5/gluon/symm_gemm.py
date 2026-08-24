@@ -340,28 +340,13 @@ def XXT_kernel(
     GROUP_SIZE_M: gl.constexpr,
     LOWER_UPPER: gl.constexpr,
     STAGES: gl.constexpr,
+    NUM_CUs: gl.constexpr,
     num_warps: gl.constexpr,
     num_blocks_m: gl.constexpr,
     num_triangular_blocks: gl.constexpr,
+    _cache_plance_holder: gl.constexpr,  # NOTE (yiakwy) : dummy argument to avoid TVM-FFI compiled result
 ):
-    pid = gl.program_id(axis=0)
-
-    batch_idx = pid // num_triangular_blocks
-    pid_local = pid % num_triangular_blocks
-
-    if GROUP_SIZE_M > 1:
-        pid_m, pid_n = triangular_swizzle(pid_local, num_blocks_m, GROUP_SIZE_M)
-    else:
-        # Simple triangular mapping without swizzling
-        pid_m, pid_n = linear_to_tril(pid_local)
-
-    m_idx = pid_m * BLOCK_SIZE_M
-    n_idx = pid_n * BLOCK_SIZE_N
-
-    gl.assume(m_idx >= n_idx)
-
-    m_idx = m_idx + batch_idx * M
-    n_idx = n_idx + batch_idx * M
+    _pid = gl.program_id(axis=0)
 
     # NOTE (yiakwy) : NV TMA does not need to use gl.DistributedLinearLayout to compute per-thread offset to load data into registers
     # NOTE (yiakwy) : NV TMA does not need the combination of gl.SliceLayout and gl.BlockedLayout to to (buffer) load data into shmem
@@ -383,116 +368,134 @@ def XXT_kernel(
     )
 
     acc_dtype = gl.float32
-    acc = warpgroup_mma_init(
-        gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wgmma_layout)
-    )
 
-    off_m = m_idx
+    for pid in range(_pid, num_triangular_blocks, NUM_CUs):
+        batch_idx = pid // num_triangular_blocks
+        pid_local = pid % num_triangular_blocks
 
-    # TODO (yiakwy) : fix
-    off_n = n_idx
+        # sched tasks
+        if GROUP_SIZE_M > 1:
+            pid_m, pid_n = triangular_swizzle(pid_local, num_blocks_m, GROUP_SIZE_M)
+        else:
+            # Simple triangular mapping without swizzling
+            pid_m, pid_n = linear_to_tril(pid_local)
 
-    # TODO (yiakwy) : add support of WASP
-    load_ready_bars = mbarrier.allocate_mbarrier(batch=STAGES)
+        m_idx = pid_m * BLOCK_SIZE_M
+        n_idx = pid_n * BLOCK_SIZE_N
 
-    write_stage = 0
-    read_stage = 0
+        gl.assume(m_idx >= n_idx)
 
-    for i in gl.static_range(STAGES):
-        # mbarrier.init(load_empty_bars.index(i), count=mma_barrier_count)
-        mbarrier.init(load_ready_bars.index(i), count=1)
+        # restore batch
+        off_m = m_idx + batch_idx * M
+        off_n = n_idx + batch_idx * M
 
-    # 1. Ramp Up to fill
-    for i in gl.static_range(STAGES):
-        off_k = i * BLOCK_SIZE_K
-        if off_k < K:
-            a = tile_a.index(write_stage)
-            at = tile_at.index(write_stage)
+        # consumer acc, must be specified inside the loop for this version of triton gluon
+        acc = warpgroup_mma_init(
+            gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wgmma_layout)
+        )
 
-            mbarrier.expect(
-                load_ready_bars.index(write_stage),
-                A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
-            )
+        # TODO (yiakwy) : add support of WASP
+        load_ready_bars = mbarrier.allocate_mbarrier(batch=STAGES)
 
-            # NOTE (yiakwy) : triton 3.6 does not suppor multicast, please updated to triton 3.7 (after Apri 2026) for the performance boost
-            tma.async_load(
-                A_desc,
-                [off_m, off_k],
-                load_ready_bars.index(write_stage),
-                a,
-                multicast=True,
-            )
-            tma.async_load(
-                AT_desc,
-                [off_n, off_k],
-                load_ready_bars.index(write_stage),
-                at,
-                multicast=True,
-            )
+        write_stage = 0
+        read_stage = 0
 
-            write_stage = (write_stage + 1) % STAGES
+        for i in gl.static_range(STAGES):
+            mbarrier.init(load_ready_bars.index(i), count=1)
 
-    tma_phase = 0
+        # 1. Ramp Up to fill
+        for i in gl.static_range(STAGES):
+            off_k = i * BLOCK_SIZE_K
+            if off_k < K:
+                a = tile_a.index(write_stage)
+                at = tile_at.index(write_stage)
 
-    # 2. Main loop
-    for k in range(gl.cdiv(K, BLOCK_SIZE_K)):
-        off_k = k * BLOCK_SIZE_K
+                mbarrier.expect(
+                    load_ready_bars.index(write_stage),
+                    A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
+                )
 
-        mbarrier.wait(load_ready_bars.index(read_stage), phase=tma_phase)
+                # NOTE (yiakwy) : triton 3.6 does not suppor multicast, please updated to triton 3.7 (after Apri 2026) for the performance boost
+                tma.async_load(
+                    A_desc,
+                    [off_m, off_k],
+                    load_ready_bars.index(write_stage),
+                    a,
+                    multicast=True,
+                )
+                tma.async_load(
+                    AT_desc,
+                    [off_n, off_k],
+                    load_ready_bars.index(write_stage),
+                    at,
+                    multicast=True,
+                )
 
-        # TODO (yiakwy) : add wgmma
-        a = tile_a.index(read_stage)
-        at = tile_at.index(read_stage)
-        at = at.permute((1, 0))
+                write_stage = (write_stage + 1) % STAGES
 
+        tma_phase = 0
+
+        # 2. Main loop
+        for k in range(gl.cdiv(K, BLOCK_SIZE_K)):
+            off_k = k * BLOCK_SIZE_K
+
+            mbarrier.wait(load_ready_bars.index(read_stage), phase=tma_phase)
+
+            # TODO (yiakwy) : add wgmma
+            a = tile_a.index(read_stage)
+            at = tile_at.index(read_stage)
+            at = at.permute((1, 0))
+
+            acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+            acc = warpgroup_mma(a, at, acc, is_async=True)
+
+            # issue next load
+            next_k = (k + STAGES) * BLOCK_SIZE_K
+            if next_k < K:
+                _a = tile_a.index(write_stage)
+                _at = tile_at.index(write_stage)
+
+                mbarrier.expect(
+                    load_ready_bars.index(write_stage),
+                    A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
+                )
+
+                tma.async_load(
+                    A_desc,
+                    [off_m, next_k],
+                    load_ready_bars.index(write_stage),
+                    _a,
+                    multicast=True,
+                )
+                tma.async_load(
+                    AT_desc,
+                    [off_n, next_k],
+                    load_ready_bars.index(write_stage),
+                    _at,
+                    multicast=True,
+                )
+                write_stage = (write_stage + 1) % STAGES
+
+            read_stage = (read_stage + 1) % STAGES
+            if read_stage == 0:
+                tma_phase ^= 1
+
+        # 3. Epilogue
         acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
-        acc = warpgroup_mma(a, at, acc, is_async=True)
 
-        # issue next load
-        next_k = (k + STAGES) * BLOCK_SIZE_K
-        if next_k < K:
-            _a = tile_a.index(write_stage)
-            _at = tile_at.index(write_stage)
+        c = gl.allocate_shared_memory(
+            C_desc.dtype, C_desc.block_type.shape, C_desc.layout
+        )
+        c.store(acc.to(C_desc.dtype))
+        fence_async_shared()
 
-            mbarrier.expect(
-                load_ready_bars.index(write_stage),
-                A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
-            )
+        # NOTE (yiakwy) : store & transpose store
+        off_n = n_idx
+        tma.async_copy_shared_to_global(C_desc, [off_m, off_n], c)
 
-            tma.async_load(
-                A_desc,
-                [off_m, next_k],
-                load_ready_bars.index(write_stage),
-                _a,
-                multicast=True,
-            )
-            tma.async_load(
-                AT_desc,
-                [off_n, next_k],
-                load_ready_bars.index(write_stage),
-                _at,
-                multicast=True,
-            )
-            write_stage = (write_stage + 1) % STAGES
-
-        read_stage = (read_stage + 1) % STAGES
-        if read_stage == 0:
-            tma_phase ^= 1
-
-    # 3. Epilogue
-    acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
-
-    c = gl.allocate_shared_memory(C_desc.dtype, C_desc.block_type.shape, C_desc.layout)
-    c.store(acc.to(C_desc.dtype))
-    fence_async_shared()
-
-    # NOTE (yiakwy) : store & transpose store
-    off_n = n_idx
-    tma.async_copy_shared_to_global(C_desc, [off_m, off_n], c)
-
-    ct = c.permute((1, 0))  # gl.transpose(c)
-    tma.async_copy_shared_to_global(C_desc, [off_n, off_m], ct)
-    tma.store_wait(pendings=0)
+        ct = c.permute((1, 0))  # gl.transpose(c)
+        tma.async_copy_shared_to_global(C_desc, [off_n, off_m], ct)
+        tma.store_wait(pendings=0)
 
 
 class GluonXXT:
@@ -531,17 +534,18 @@ class GluonXXT:
 
         if out is None:
             if A.ndim == 2:
-                C = torch.empty((M, M), device=A.device, dtype=A.dtype)
+                out = torch.empty((M, M), device=A.device, dtype=A.dtype)
             else:
-                C = torch.empty(A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
+                out = torch.empty(A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
+            cache_mode = 1
         else:
-            C = out
+            cache_mode = 0
 
         a_layout = gl.NVMMASharedLayout.get_default_for(self.a_shape, gl.bfloat16)
         c_layout = gl.NVMMASharedLayout.get_default_for(self.c_shape, gl.bfloat16)
 
         A_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
-        C_desc = TensorDescriptor.from_tensor(C, self.c_shape, c_layout)
+        C_desc = TensorDescriptor.from_tensor(out, self.c_shape, c_layout)
 
         AT_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
 
@@ -571,12 +575,14 @@ class GluonXXT:
             GROUP_SIZE_M=self.GROUP_SIZE_M,
             LOWER_UPPER=self.LOWER_UPPER,
             STAGES=self.STAGES,
+            NUM_CUs=self.NUM_CUs,
             num_warps=self.NUM_WARPS,  # 8 for multi stages, 12 for 1 x producer wg, 2 x consumers wg
             num_blocks_m=num_blocks_m,
             num_triangular_blocks=num_triangular_blocks,
+            _cache_plance_holder=cache_mode,
         )
 
-        return C
+        return out
 
 
 # Unified interface for XXT and XXL

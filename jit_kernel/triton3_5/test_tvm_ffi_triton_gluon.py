@@ -44,7 +44,8 @@ def test(m=2048):
     ), f"[1st Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel ({sentinel})."
 
     # reset the op
-    symm_gemm_op = s.GluonXXT()
+    # symm_gemm_op = s.GluonXXT()
+
     sentinel = float("-1234")
 
     # second call: cached TVM-FFI path only
