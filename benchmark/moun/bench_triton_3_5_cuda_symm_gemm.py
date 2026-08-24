@@ -238,10 +238,11 @@ def calculate_diff(m, dummy):
         _ = XXT(x)
     end_event.record()
     torch.cuda.synchronize()
+
     triton_ref_time = (time.time() - start) / iters * 1000
     triton_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
 
-    # === ThunderMuon Symm Gemm - baseline (CUDA) ===
+    # === ThunderMuon Symm Gemm - baseline (triton gluon) ===
     symm_gemm_op = GluonXXT()
 
     for _ in range(warmup):
@@ -261,7 +262,7 @@ def calculate_diff(m, dummy):
     gluon_ref_time = (time.time() - start) / iters * 1000
     gluon_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
 
-    # === ThunderMuon Symm Gemm - baseline (CUDA) ===
+    # === ThunderMuon Symm Gemm (CUDA) ===
     for _ in range(warmup):
         _ = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
     torch.cuda.synchronize()

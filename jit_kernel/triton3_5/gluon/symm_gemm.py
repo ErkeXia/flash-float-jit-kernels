@@ -62,6 +62,68 @@ def linear_to_tril(pid):
     return row, col
 
 
+# Compute triangular sum
+@gluon.jit
+def sum_tri(h):
+    return h * (h + 1) // 2
+
+
+@gluon.jit
+def triangular_swizzle(pid, num_blocks_m, GROUP_SIZE_M: gl.constexpr):
+    """
+    Maps linear task ID to triangular block indices with swizzling.
+    This implements the C++ triangular scheduling algorithm.
+    """
+    # Compute row and col from linear triangular index
+    # TODO (yiakwy) : use linear_to_tril
+    row = gl.floor((tl.math.sqrt(8.0 * pid + 1.0) - 1.0) / 2.0).to(gl.int32)
+    col = pid - (row * (row + 1)) // 2
+
+    if GROUP_SIZE_M > 1:
+        # Grouping for better L2 cache locality
+        group_id = row // GROUP_SIZE_M
+        group_off_row = group_id * GROUP_SIZE_M
+        group_size_m = min(num_blocks_m - group_off_row, GROUP_SIZE_M)
+
+        og_off = sum_tri(group_off_row)
+
+        # Check if we're in the first part of the group
+        ig_col_off = group_off_row
+        in_group_idx = pid - og_off
+
+        if in_group_idx < ig_col_off * group_size_m:
+            # First part: simple mapping (rectangular region)
+            block_idx_m = group_off_row + (in_group_idx % group_size_m)
+            block_idx_n = in_group_idx // group_size_m
+        else:
+            # Second part: triangular mapping within the group
+            sub_in_group_id = in_group_idx - ig_col_off * group_size_m
+
+            # Solve quadratic: h^2 + h - 2*sub_in_group_id - 1/4 ≈ 0
+            c0 = gl.floor(
+                tl.math.sqrt(
+                    group_size_m * group_size_m
+                    + group_size_m
+                    - 2 * sub_in_group_id
+                    - 0.25
+                )
+                - 0.5
+            ).to(gl.int32)
+
+            c0_plus_1 = c0 + 1
+            c1 = group_size_m - c0_plus_1
+
+            # Compute block indices
+            term1 = (group_size_m + c0_plus_1 + 1) * (group_size_m - c0_plus_1) // 2
+            block_idx_m = group_off_row + (sub_in_group_id - term1) + c1
+            block_idx_n = ig_col_off + c1
+    else:
+        block_idx_m = row
+        block_idx_n = col
+
+    return block_idx_m, block_idx_n
+
+
 @gluon.jit
 def _compute_pid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M):
     if GROUP_SIZE_M == 1:
@@ -266,6 +328,7 @@ def pick_wgmma_layout(dtype, BLOCK_M, BLOCK_N, num_warps):
 @gluon.jit
 def XXT_kernel(
     A_desc,
+    AT_desc,
     C_desc,
     M,
     K,
@@ -278,50 +341,35 @@ def XXT_kernel(
     LOWER_UPPER: gl.constexpr,
     STAGES: gl.constexpr,
     num_warps: gl.constexpr,
+    num_blocks_m: gl.constexpr,
+    num_triangular_blocks: gl.constexpr,
 ):
     pid = gl.program_id(axis=0)
 
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(M, BLOCK_SIZE_N)
+    batch_idx = pid // num_triangular_blocks
+    pid_local = pid % num_triangular_blocks
 
-    batch_idx = pid // (num_pid_m * num_pid_n)
-    pid_local = pid % (num_pid_m * num_pid_n)
-
-    if GROUP_SIZE_M == 1:
-        pid_n = pid_local % num_pid_n
-        pid_m = pid_local // num_pid_n
+    if GROUP_SIZE_M > 1:
+        pid_m, pid_n = triangular_swizzle(pid_local, num_blocks_m, GROUP_SIZE_M)
     else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid_local // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((pid_local % num_pid_in_group) % group_size_m)
-        pid_n = (pid_local % num_pid_in_group) // group_size_m
-
-    # TODO (yiakwy) : replace with
-    # pid_n, pid_m = _compute_pid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M) # type: ignore
+        # Simple triangular mapping without swizzling
+        pid_m, pid_n = linear_to_tril(pid_local)
 
     m_idx = pid_m * BLOCK_SIZE_M
     n_idx = pid_n * BLOCK_SIZE_N
 
-    # TODO (yiakwy) : updated to new scheduler for triangular matrix
-    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-
-    gl.assume(skip_block_above_diag == True)
-
-    if skip_block_below_diag or skip_block_above_diag:
-        return
+    gl.assume(m_idx >= n_idx)
 
     m_idx = m_idx + batch_idx * M
     n_idx = n_idx + batch_idx * M
 
     # NOTE (yiakwy) : NV TMA does not need to use gl.DistributedLinearLayout to compute per-thread offset to load data into registers
-
     # NOTE (yiakwy) : NV TMA does not need the combination of gl.SliceLayout and gl.BlockedLayout to to (buffer) load data into shmem
-
     dtype: gl.constexpr = A_desc.dtype
     tile_a = gl.allocate_shared_memory(
+        dtype, [STAGES] + A_desc.block_type.shape, A_desc.layout
+    )
+    tile_at = gl.allocate_shared_memory(
         dtype, [STAGES] + A_desc.block_type.shape, A_desc.layout
     )
 
@@ -341,8 +389,8 @@ def XXT_kernel(
 
     off_m = m_idx
 
-    # mma_barrier_count : gl.constexpr = 4 # COMPUTE_WARPS
-    # load_empty_bars = allocate_mbarrier(batch=STAGES)
+    # TODO (yiakwy) : fix
+    off_n = n_idx
 
     # TODO (yiakwy) : add support of WASP
     load_ready_bars = mbarrier.allocate_mbarrier(batch=STAGES)
@@ -359,9 +407,11 @@ def XXT_kernel(
         off_k = i * BLOCK_SIZE_K
         if off_k < K:
             a = tile_a.index(write_stage)
+            at = tile_at.index(write_stage)
 
             mbarrier.expect(
-                load_ready_bars.index(write_stage), A_desc.block_type.nbytes
+                load_ready_bars.index(write_stage),
+                A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
             )
 
             # NOTE (yiakwy) : triton 3.6 does not suppor multicast, please updated to triton 3.7 (after Apri 2026) for the performance boost
@@ -372,14 +422,19 @@ def XXT_kernel(
                 a,
                 multicast=True,
             )
-            # async_copy_global_to_shared(tensor_desc, coord, barrier, result, pred=True, _semantic=None):
+            tma.async_load(
+                AT_desc,
+                [off_n, off_k],
+                load_ready_bars.index(write_stage),
+                at,
+                multicast=True,
+            )
 
             write_stage = (write_stage + 1) % STAGES
 
     tma_phase = 0
 
     # 2. Main loop
-    ssteps = gl.cdiv(K, BLOCK_SIZE_K)
     for k in range(gl.cdiv(K, BLOCK_SIZE_K)):
         off_k = k * BLOCK_SIZE_K
 
@@ -387,7 +442,8 @@ def XXT_kernel(
 
         # TODO (yiakwy) : add wgmma
         a = tile_a.index(read_stage)
-        at = a.permute((1, 0))  # gl.transpose(a)
+        at = tile_at.index(read_stage)
+        at = at.permute((1, 0))
 
         acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
         acc = warpgroup_mma(a, at, acc, is_async=True)
@@ -396,9 +452,11 @@ def XXT_kernel(
         next_k = (k + STAGES) * BLOCK_SIZE_K
         if next_k < K:
             _a = tile_a.index(write_stage)
+            _at = tile_at.index(write_stage)
 
             mbarrier.expect(
-                load_ready_bars.index(write_stage), A_desc.block_type.nbytes
+                load_ready_bars.index(write_stage),
+                A_desc.block_type.nbytes + AT_desc.block_type.nbytes,
             )
 
             tma.async_load(
@@ -408,7 +466,13 @@ def XXT_kernel(
                 _a,
                 multicast=True,
             )
-
+            tma.async_load(
+                AT_desc,
+                [off_n, next_k],
+                load_ready_bars.index(write_stage),
+                _at,
+                multicast=True,
+            )
             write_stage = (write_stage + 1) % STAGES
 
         read_stage = (read_stage + 1) % STAGES
@@ -437,8 +501,8 @@ class GluonXXT:
         BLOCK_SIZE_M: int = 128,
         BLOCK_SIZE_N: int = 128,
         BLOCK_SIZE_K: int = 64,
-        GROUP_SIZE_M: int = 8,
-        STAGES: int = 4,
+        GROUP_SIZE_M: int = 4,
+        STAGES: int = 2,
         NUM_WARPS: int = 8,
         LOWER_UPPER: int = 1,  # NOTE (yiakwy) : 1 skip block above diaglogue; 0 skip block below diaglogue
     ):
@@ -454,18 +518,24 @@ class GluonXXT:
         self.NUM_WARPS = NUM_WARPS
         self.LOWER_UPPER = LOWER_UPPER
 
+        self.NUM_CUs = 132
+
     # TODO (yiakwy) : cache TVM-FFI compiled result
 
     def __call__(
-        self, A: torch.Tensor, C: Optional[torch.Tensor] = None
+        self,
+        A: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         M, K = A.shape[-2:]
 
-        if C is None:
+        if out is None:
             if A.ndim == 2:
                 C = torch.empty((M, M), device=A.device, dtype=A.dtype)
             else:
                 C = torch.empty(A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
+        else:
+            C = out
 
         a_layout = gl.NVMMASharedLayout.get_default_for(self.a_shape, gl.bfloat16)
         c_layout = gl.NVMMASharedLayout.get_default_for(self.c_shape, gl.bfloat16)
@@ -473,22 +543,28 @@ class GluonXXT:
         A_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
         C_desc = TensorDescriptor.from_tensor(C, self.c_shape, c_layout)
 
+        AT_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
+
         batch_size = A.size(0) if A.ndim == 3 else 1
+
         # input_batch_stride = A.stride(0) if A.ndim == 3 else 0
         # output_batch_stride = C.stride(0) if C.ndim == 3 else 0
 
         M, K = A.shape[-2:]
 
-        num_pid_m = triton.cdiv(M, self.BLOCK_SIZE_M)
-        grid = (batch_size * num_pid_m * num_pid_m,)
+        num_blocks_m = triton.cdiv(M, self.BLOCK_SIZE_M)
+        num_triangular_blocks = (num_blocks_m * (num_blocks_m + 1)) // 2
+
+        grid_size = min(self.NUM_CUs, batch_size * num_triangular_blocks)
+
+        grid = (grid_size,)
 
         XXT_kernel[grid](
             A_desc,
+            AT_desc,
             C_desc,
             M=M,
             K=K,
-            # a_stride_b=input_batch_stride, a_stride_r=A.stride(-2), a_stride_c=A.stride(-1),
-            # c_stride_b=output_batch_stride, c_stride_r=C.stride(-2), c_stride_c=C.stride(-1),
             BLOCK_SIZE_M=self.BLOCK_SIZE_M,
             BLOCK_SIZE_N=self.BLOCK_SIZE_N,
             BLOCK_SIZE_K=self.BLOCK_SIZE_K,
@@ -496,6 +572,8 @@ class GluonXXT:
             LOWER_UPPER=self.LOWER_UPPER,
             STAGES=self.STAGES,
             num_warps=self.NUM_WARPS,  # 8 for multi stages, 12 for 1 x producer wg, 2 x consumers wg
+            num_blocks_m=num_blocks_m,
+            num_triangular_blocks=num_triangular_blocks,
         )
 
         return C
