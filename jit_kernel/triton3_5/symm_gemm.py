@@ -97,7 +97,8 @@ if version.parse(triton.__version__) < version.parse("3.6"):
         return new_pid
 
     @triton.jit
-    def swizzle2d(pid, grid_m, grid_n, GROUP_M: tl.constexpr):
+    def swizzle2d(pid_m, pid_n, grid_m, grid_n, GROUP_M: tl.constexpr):
+        pid = pid_m * grid_n + pid_n
         width = GROUP_M * grid_n
 
         group_id = pid // width
