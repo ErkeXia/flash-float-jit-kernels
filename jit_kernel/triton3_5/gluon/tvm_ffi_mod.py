@@ -262,6 +262,7 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 #include <cuda_runtime.h>
 #include <cuda.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -396,11 +397,29 @@ void {kernel_name}_launcher(
         static_cast<unsigned int>(grid_z));
     tvm::ffi::dim3 block({num_warps * warp_size}, 1, 1);
 
-    size_t kargs_size = sizeof(KernelArgs);
-    void* config[] = {{
-        CU_LAUNCH_PARAM_BUFFER_POINTER, &kargs,
-        CU_LAUNCH_PARAM_BUFFER_SIZE, &kargs_size,
-        CU_LAUNCH_PARAM_END
+    void* params[] = {{
+        &kargs.A_desc,
+        &kargs.A_desc_shape_0,
+        &kargs.A_desc_shape_1,
+        &kargs.A_desc_stride_0,
+        &kargs.A_desc_stride_1,
+
+        &kargs.AT_desc,
+        &kargs.AT_desc_shape_0,
+        &kargs.AT_desc_shape_1,
+        &kargs.AT_desc_stride_0,
+        &kargs.AT_desc_stride_1,
+
+        &kargs.C_desc,
+        &kargs.C_desc_shape_0,
+        &kargs.C_desc_shape_1,
+        &kargs.C_desc_stride_0,
+        &kargs.C_desc_stride_1,
+
+        &kargs.M,
+        &kargs.K,
+        &kargs.global_scratch,
+        &kargs.profile_scratch,
     }};
 
     CUresult result = cuLaunchKernel(
@@ -409,8 +428,8 @@ void {kernel_name}_launcher(
         block.x, block.y, block.z,
         static_cast<unsigned int>(shared_mem_bytes),
         stream,
-        nullptr,
-        config);
+        params,
+        nullptr);
     if (result != CUDA_SUCCESS) {{
         CHECK_CUDA_DRIVER_ERROR(result);
     }}
