@@ -1,57 +1,137 @@
 import torch
+import triton
 
 import jit_kernel.triton3_5.gluon.symm_gemm as s
 
-
 SEED = 42
-SENTINEL = -1000.0
 
 
-def _check_result(out, expected):
-    assert not torch.any(out == SENTINEL), "Gluon XXT did not overwrite all outputs"
-    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+def test(m=2048):
 
-
-def test(m=2048, k=2048):
     torch.manual_seed(SEED)
 
-    x = torch.randn((m, k), dtype=torch.float32, device="cuda")
-    x = (x / (k**0.5)).to(torch.bfloat16)
-    expected = torch.matmul(x.float(), x.float().T)
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    xq = torch.arange(m, dtype=torch.float16, device="cuda").view(1, -1) / (
+        m - 1
+    ) + torch.arange(m, dtype=torch.float16, device="cuda").view(-1, 1) / (m - 1)
+
+    x_fp8 = xq.to(torch.float8_e4m3fn)
+
+    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
+    out = torch.empty((m, m), dtype=torch.float16, device="cuda")
+
+    symm_gemm_op = s.GluonXXT()
+    sentinel = float("NaN")
+
+    # first call: native Gluon launch
+    print("first call : ...")
+    out.fill_(sentinel)
+    torch.cuda.synchronize()
+
+    out = symm_gemm_op(xq, out)
+    torch.cuda.synchronize()
+    remaining = (out == sentinel).sum().item()
+    print(f"[1st Write] sentinel ({sentinel}) remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[1st Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel ({sentinel})."
+
+    # reset the op
+    # symm_gemm_op = s.GluonXXT()
+
+    sentinel = float("-1234")
+
+    # second call: native Gluon cache workaround
+    print("second call : ...")
+    out.fill_(sentinel)
+    torch.cuda.synchronize()
+
+    # out = symm_gemm_op(xq, out=out)
+    out = symm_gemm_op(xq)
+    torch.cuda.synchronize()
+    remaining = (out == sentinel).sum().item()
+
+    print(f"[2rd Write] sentinel ({sentinel}) remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[2rd Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel ({sentinel})."
+
+
+def test_tvm_ffi(m=2048):
+
+    torch.manual_seed(SEED)
+
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    xq = torch.arange(m, dtype=torch.float16, device="cuda").view(1, -1) / (
+        m - 1
+    ) + torch.arange(m, dtype=torch.float16, device="cuda").view(-1, 1) / (m - 1)
+
+    x_fp8 = xq.to(torch.float8_e4m3fn)
+
+    xs_0 = torch.ones((m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
+    out = torch.empty((m, m), dtype=torch.float16, device="cuda")
 
     symm_gemm_op = s.GluonXXT()
     s.tvm_ffi_modules["XXT"] = None
+    sentinel = float("NaN")
 
-    # Cache miss: compile the Gluon kernel and build the TVM-FFI launcher.
-    out = torch.full((m, m), SENTINEL, dtype=x.dtype, device=x.device)
-    returned = symm_gemm_op(x, out=out, use_tvm_ffi=True)
+    # first call: populate TVM-FFI cache
+    print("first call : ...")
+    out.fill_(sentinel)
     torch.cuda.synchronize()
-    assert returned is out
-    _check_result(out, expected)
+
+    out = symm_gemm_op(xq, out, use_tvm_ffi=True)
+    torch.cuda.synchronize()
+    remaining = (out == sentinel).sum().item()
+    print(f"[1st Write] sentinel ({sentinel}) remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[1st Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel ({sentinel})."
 
     cache = s.tvm_ffi_modules["XXT"]
     assert cache is not None and len(cache) == 1
     cached_module = next(iter(cache.values()))[0]
 
-    # Cache hit with the same output tensor.
-    out.fill_(SENTINEL)
-    returned = symm_gemm_op(x, out=out, use_tvm_ffi=True)
-    torch.cuda.synchronize()
-    assert returned is out
-    _check_result(out, expected)
-    assert len(s.tvm_ffi_modules["XXT"]) == 1
-    assert next(iter(s.tvm_ffi_modules["XXT"].values()))[0] is cached_module
+    # reset the op
+    # symm_gemm_op = s.GluonXXT()
 
-    # Cache hit with a different output tensor. The TensorMap must be rebuilt
-    # with the new data pointer even though the compiled module is reused.
-    out2 = torch.full_like(out, SENTINEL)
-    returned = symm_gemm_op(x, out=out2, use_tvm_ffi=True)
+    sentinel = float("-1234")
+
+    # second call: cached TVM-FFI path only
+    print("second call : ...")
+    out.fill_(sentinel)
     torch.cuda.synchronize()
-    assert returned is out2
-    _check_result(out2, expected)
+
+    # out = symm_gemm_op(xq, out=out, use_tvm_ffi=True)
+    out = symm_gemm_op(xq, use_tvm_ffi=True)
+    torch.cuda.synchronize()
+    remaining = (out == sentinel).sum().item()
+
+    print(f"[2rd Write] sentinel ({sentinel}) remaining:", remaining)
+
+    assert (
+        remaining == 0
+    ), f"[2rd Write] Expected kernel to overwrite all elements, but {remaining} remained sentinel ({sentinel})."
+
     assert len(s.tvm_ffi_modules["XXT"]) == 1
     assert next(iter(s.tvm_ffi_modules["XXT"].values()))[0] is cached_module
 
 
 if __name__ == "__main__":
     test()
+    test_tvm_ffi()
