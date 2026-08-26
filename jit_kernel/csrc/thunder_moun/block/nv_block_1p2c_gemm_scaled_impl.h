@@ -125,7 +125,7 @@ struct HopperPersistentSplitKPipeline {
         const float* scale_X,
         const float* scale_W,
         half* Out,
-        int M, int N, int K,
+        int M, int N, int K, int B,
         int total_symmetric_tiles,
         int num_blocks_m,
         int num_blocks_n,
@@ -150,6 +150,8 @@ struct HopperPersistentSplitKPipeline {
         bool is_leader_thr_in_wgs = is_consumer ? (tid == 0) : (tid == CONSUMER_THREADS);
 
         if (is_producer && is_leader_thr_in_wgs) {
+            // NOTE (yiakwy) : batch symmetric gemm : a single batch-expanded 2D TMA descriptor
+            // serves all batches (see symm_gemm_fp8_block_scaled), so prefetch only those two.
             {
                 uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
                 asm volatile (
@@ -218,7 +220,7 @@ struct HopperPersistentSplitKPipeline {
         if (split_k > 1) {
             if (threadIdx.x == 0) {
                 nvgpu::arch::tma_init_barrier<false>(&epilogue_barriers[0], split_k - 1);
-                nvgpu::arch::tma_init_barrier<false>(&epilogue_readable_barriers[0], 1);
+                nvgpu::arch::tma_init_barrier<false>(&epilogue_readable_barriers[0], split_k - 1);
             }
         }
         nvgpu::arch::tma_store_fence();
@@ -246,6 +248,11 @@ struct HopperPersistentSplitKPipeline {
         int local_task_id = blockIdx.y;
         __syncthreads();
 
+        // NOTE (yiakwy) : batch symmetric gemm, mimicking the triton gluon XXT_kernel:
+        //   batch_idx = pid // (num_pid_m * num_pid_n); tile_id = pid % (num_pid_m * num_pid_n)
+        //   i.e. the batch is the outter-most scheduling dimension of the linear tile id.
+        const int tiles_per_batch = total_symmetric_tiles / B;
+
         // Start TMA pipeline
         if (is_producer) {
             nvgpu::arch::reg_dealloc_decrease_registers<40>();
@@ -258,14 +265,22 @@ struct HopperPersistentSplitKPipeline {
 
                 while (local_task_id < total_symmetric_tiles) {
 
-                    auto idx = get_block_indices_tri_linear(local_task_id);
+                    const int batch_idx = local_task_id / tiles_per_batch;
+                    const int local_tile_id = local_task_id % tiles_per_batch;
+
+                    auto idx = get_block_indices_tri_linear(local_tile_id);
                     int block_idx_m = xpu::get<0>(idx);
                     int block_idx_n = xpu::get<1>(idx);
 
                     // Grouping for better L2 cache locality in TMA load
                     const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
 
-                    get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+                    get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_tile_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+
+                    // NOTE (yiakwy) : add batch symmetric gemm support
+                    const int batch_offset_m = batch_idx * M;
+                    const int batch_offset_n = batch_idx * N;
+                    // For B > 1 cluster multicast is disabled by the caller (use_multicast = (B == 1)).
 
                     // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
@@ -274,15 +289,16 @@ struct HopperPersistentSplitKPipeline {
 
         #if  USE_CLUSTER_MULTICAST
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
-                        tid, group_id, block_idx_m, block_idx_n,
+                        tid, group_id, batch_offset_m, batch_offset_n, block_idx_m, block_idx_n,
                         k_start, k_end, total_stage_bytes,
                         tma_desc_X, tma_desc_W,
                         shmem_X, shmem_W, barriers, empty_barriers,
                         cluster_mask, cluster_group_m_rank, cache_hint_lhs, cache_hint_rhs,
+                        /*use_multicast=*/(B == 1),
                         write_stage/*src & dst*/, tma_phase/*src & dst*/);
         #else
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
-                        tid, group_id, block_idx_m, block_idx_n,
+                        tid, group_id, batch_offset_m, batch_offset_n, block_idx_m, block_idx_n,
                         k_start, k_end, total_stage_bytes,
                         tma_desc_X, tma_desc_W,
                         shmem_X, shmem_W, barriers, empty_barriers,
@@ -311,7 +327,9 @@ struct HopperPersistentSplitKPipeline {
             // TODO (yiakwy) : rename
             int tma_phase = 0;
 
+            // TODO (yiakwy) : rename
             uint32_t epilogue_phase = 0;
+            uint32_t epilogue_readable_phase = 0;
 
             int offset = STAGES * (BM * BK + BN * BK);
             OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + offset);
@@ -319,11 +337,6 @@ struct HopperPersistentSplitKPipeline {
 
             constexpr int SCLAE_BLOCK_SIZE_K = 128;
             constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
-
-            /*
-            __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
-            __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
-             */
 
             offset += sizeof(OutDtype) * BM * BN;
             auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
@@ -337,18 +350,30 @@ struct HopperPersistentSplitKPipeline {
             while (local_task_id < total_symmetric_tiles) {
                 accum.clear();
 
-                auto idx = get_block_indices_tri_linear(local_task_id);
+                const int batch_idx = local_task_id / tiles_per_batch;
+                const int local_tile_id = local_task_id % tiles_per_batch;
+
+                auto idx = get_block_indices_tri_linear(local_tile_id);
                 int block_idx_m = xpu::get<0>(idx);
                 int block_idx_n = xpu::get<1>(idx);
 
                 // Grouping for better L2 cache locality in TMA load
                 const uint32_t group_id = block_idx_m / GROUP_SIZE_M;
 
-                get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_task_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+                get_block_indices_tri_linear_swizzled<GROUP_SIZE_M>(local_tile_id, block_idx_m/*dest*/, block_idx_n/*dest*/, num_blocks_m, group_id);
+
+                // NOTE (yiakwy) : add batch symmetric gemm support
+                const int _block_idx_m = block_idx_m;
+                const int _block_idx_n = block_idx_n;
+
+                const int batch_offset_m = batch_idx * M;
+
+                block_idx_m += batch_idx * num_blocks_m;
+                block_idx_n += batch_idx * num_blocks_n;
 
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                 if (threadIdx.x == 0 && blockIdx.x == 0) {
-                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] : block#(%d, %d), group_id#%d prefetching scales ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n, group_id);
+                    printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] : batch#%d block#(%d, %d), group_id#%d prefetching scales ...\n", blockIdx.x, blockIdx.y, batch_idx, _block_idx_m, _block_idx_n, group_id);
                 }
                 warpgroup_sync();
 #endif
@@ -491,8 +516,11 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
     #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
-                if (threadIdx.x == 0 && blockIdx.x == 1) {
-                    printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
+                // NOTE (yiakwy) : debug trace, keep silent by default (printf serializes the SM)
+                if constexpr (DEBUG_BLOCK) {
+                    if (threadIdx.x == 0 && blockIdx.x == 1) {
+                        printf("[Epilogue] [Split#%d] [SM#%d] write split_k#%d block <%d, %d> on-chip reduce via NoC...\n", blockIdx.x, blockIdx.y, split_k, block_idx_m, block_idx_n);
+                    }
                 }
 
                 auto cluster = cooperative_groups::this_cluster();
@@ -504,6 +532,10 @@ struct HopperPersistentSplitKPipeline {
                             uint32_t target_cta_rank = 0;
                             mbar_arrive_cluster_release(&epilogue_barriers[0], target_cta_rank);
                         }
+
+                        nvgpu::arch::tma_wait(__cvta_generic_to_shared(&epilogue_readable_barriers[0]), epilogue_readable_phase);
+                        epilogue_readable_phase ^= 1;
+                        warpgroup_sync();
 
                     } else if (split_k_id == 0) {
 
@@ -521,7 +553,6 @@ struct HopperPersistentSplitKPipeline {
                                 dst[r] = dst_shmem_epilogue;
                             }
                         }
-                        // __syncthreads();
                         warpgroup_sync();
 
                         // TODO (yiakwy) : use nv::arch::cluster_cp_async_bulk
@@ -593,7 +624,13 @@ struct HopperPersistentSplitKPipeline {
                                 shmem_epilogue[idx] += dst_shmem_epilogue[idx];
                             }
                         }
+                        warpgroup_sync();
 
+                        if (threadIdx.x == 0) {
+                            for (int r = 1; r < split_k; ++r) {
+                                mbar_arrive_cluster_release(&epilogue_readable_barriers[0], static_cast<uint32_t>(r));
+                            }
+                        }
                         warpgroup_sync();
 
                     } // split_k_id == 0
@@ -616,7 +653,7 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                            "r"(_block_idx_n * BN), "r"(_block_idx_m * BM + batch_offset_m)
                             : "memory"
                         );
     #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
@@ -631,7 +668,7 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
                     // NOTE (yiakwy) :  transpose copy to upper right
-                    if (block_idx_m > block_idx_n) {
+                    if (_block_idx_m > _block_idx_n) {
 
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                         if (threadIdx.x == 0) {
@@ -665,7 +702,7 @@ struct HopperPersistentSplitKPipeline {
                                 " [%0, {%2, %3}], [%1];"
                                 :
                                 : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                                "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                                "r"(_block_idx_n * BN), "r"(_block_idx_m * BM + batch_offset_m)
                             );
 
                             const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
@@ -675,7 +712,7 @@ struct HopperPersistentSplitKPipeline {
                                 " [%0, {%2, %3}], [%1];"
                                 :
                                 : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
-                                    "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                                    "r"(_block_idx_n * BN + 64), "r"(_block_idx_m * BM + batch_offset_m)
                             );
     #else
                             asm volatile (
@@ -683,7 +720,7 @@ struct HopperPersistentSplitKPipeline {
                                 " [%0, {%2, %3}], [%1];"
                                 :
                                 : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                                "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                                "r"(_block_idx_m * BN), "r"(_block_idx_n * BM + batch_offset_m)
                             );
     #endif // SWIZZLE_64B_STORE
                             asm volatile("cp.async.bulk.commit_group;");
@@ -703,7 +740,7 @@ struct HopperPersistentSplitKPipeline {
                                 " [%0, {%2, %3}], [%1];"
                                 :
                                 : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                                "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                                "r"(_block_idx_m * BN), "r"(_block_idx_n * BM + batch_offset_m)
                             );
 
                         } // outplace copy
