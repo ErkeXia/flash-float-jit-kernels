@@ -186,15 +186,13 @@ def calculate_diff(m, dummy):
     torch.testing.assert_close(o_gluon_ref, o_torch_ref, rtol=5e-01, atol=1e-03)
 
     o_symm_fp8_tril = symm_gemm_block_scaled(
-        xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1
+        xq_fp8, wq_fp8, xs_0, xs_1
     ).cpu()
 
     print("o_symm_fp8_tril (cuda symm) : ", o_symm_fp8_tril)
 
     diff = o_torch_ref - o_symm_fp8_tril
     print("diff (cuda symm): ", diff)
-    # print("diff 0 (cuda symm): ", diff[0:8,0:8])
-    # print("diff 1 (cuda symm): ", diff[0:9,0:9])
 
     torch.testing.assert_close(o_symm_fp8_tril, o_torch_ref, rtol=5e-01, atol=1e-03)
 
@@ -297,11 +295,160 @@ def calculate_diff(m, dummy):
     )
 
 
+def calculate_diff_batch(m, B):
+    # NOTE (yiakwy) : batched symmetric gemm correctness check, mimicking the triton
+    # gluon XXT batch support. The batched kernels treat the (B, M, M) tensors as
+    # contiguous rows (batch is the outter-most scheduling dim).
+    torch.manual_seed(SEED)
+
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    x = torch.randn(B, m, m, dtype=torch.bfloat16, device="cuda")
+    xs_0 = torch.ones((B, m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
+    xq_fp8 = x.to(torch.float8_e4m3fn)
+    wq_fp8 = x.to(torch.float8_e4m3fn)
+
+    print("x.shape : ", x.shape)
+    print("xs_0.shape : ", xs_0.shape)
+    print("xs_1.shape : ", xs_1.shape)
+
+    o_torch_ref = (x @ x.transpose(-1, -2)).cpu()
+
+    # print("o_torch_ref : ", o_torch_ref)
+
+    def rel_err(a, ref):
+        return (a - ref).float().norm().item() / ref.float().norm().item()
+
+    symm_gemm_op = GluonXXT()
+
+    o_gluon_ref = symm_gemm_op(x).cpu()
+
+    # print("o_gluon_ref : ", o_gluon_ref)
+
+    e = rel_err(o_gluon_ref, o_torch_ref)
+    print(f"gluon ref rel err (Frobenius) : {e:.4e}")
+
+    import pdb
+    # pdb.set_trace()
+
+    torch.testing.assert_close(o_gluon_ref, o_torch_ref, rtol=5e-02, atol=1e-02)
+
+    # NOTE (yiakwy) : the cuda kernel emits fp16 while the reference is bf16
+    o_symm_fp8_tril = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1).cpu()
+    e = rel_err(o_symm_fp8_tril, o_torch_ref)
+    print(f"cuda symm (batched) rel err : {e:.4e}")
+    assert e < 5e-02, f"cuda symm (batched) mismatch : rel err {e:.4e}"
+
+    print(f"✅ B={B}, {m}x{m}x{m} thunder_moun_gemm (batched)")
+    torch.cuda.synchronize()
+
+    if DEBUG:
+        return
+
+    warmup = 25
+    iters = 100
+    for _ in range(warmup):
+        _ = x @ x.transpose(-1, -2)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        _ = x @ x.transpose(-1, -2)
+    end_event.record()
+    torch.cuda.synchronize()
+    torch_time = (time.time() - start) / iters * 1000
+    torch_device_elapsed = start_event.elapsed_time(end_event) / iters
+
+    # === modded-gpt XXT - baseline (triton ref, 3D batched) ===
+    for _ in range(warmup):
+        _ = XXT(x)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        _ = XXT(x)
+    end_event.record()
+    torch.cuda.synchronize()
+    triton_ref_time = (time.time() - start) / iters * 1000
+    triton_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
+
+    # === Gluon TMA ref (3D batched) ===
+    symm_gemm_op = GluonXXT()
+
+    for _ in range(warmup):
+        _ = symm_gemm_op(x)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        _ = symm_gemm_op(x)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    gluon_ref_time = (time.time() - start) / iters * 1000
+    gluon_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
+
+    # === ThunderMuon Symm Gemm (CUDA, batched) ===
+    for _ in range(warmup):
+        _ = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        o_symm_fp8_tril = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
+    end_event.record()
+    torch.cuda.synchronize()
+    symm_gemm_time = (time.time() - start) / iters * 1000
+    symm_gemm_device_elapsed = start_event.elapsed_time(end_event) / iters
+
+    print(f"\nPerformance (B={B}, m={m}):")
+    print(
+        f"PyTorch                      : {torch_time:.3f} ms, device {torch_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Triton ref kernel             : {triton_ref_time:.3f} ms, device {triton_ref_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Gluon TMA kernel             : {gluon_ref_time:.3f} ms, device {gluon_ref_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Cuda Muon Symm Gemm          : {symm_gemm_time:.3f} ms, device {symm_gemm_device_elapsed:.3f} ms"
+    )
+    print(
+        f"Speedup (cuda symm V3)       : {torch_time/symm_gemm_time:.2f}x, {torch_device_elapsed / symm_gemm_device_elapsed:.2f}x"
+    )
+
+
 M = [2048, 4096, 8192]
 dummy = [1]
 
 configs = list(itertools.product(M, dummy))
 
+B = [1, 4, 16]
+BATCH_CONFIGS = list(itertools.product(M, B))
+
+BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096], [1, 4, 8, 16]))
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -318,7 +465,7 @@ configs = list(itertools.product(M, dummy))
             "torch",
             "triton_muon_symm_gemm_ref",
             "gluon_muon_symm_gemm",
-            "cuda_muon_symm_gemm (not optimized)",
+            "cuda_muon_symm_gemm",
         ],
         styles=[
             ("red", "-"),
@@ -379,19 +526,98 @@ def benchmark(m: int, dummy: int, provider) -> None:
     return ms * 1000, min_ms * 1000, max_ms * 1000
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["m", "B"],
+        x_vals=BATCH_BENCH_CONFIGS,
+        line_arg="provider",
+        line_vals=[
+            "torch",
+            "triton_impl_ref",
+            "gluon_muon_symm_gemm",
+            "cuda_muon_symm_gemm",
+        ],
+        line_names=[
+            "torch",
+            "triton_ref",
+            "gluon_muon_symm_gemm",
+            "cuda_muon_symm_gemm",
+        ],
+        styles=[
+            ("red", "-"),
+            ("blue", "-"),
+            ("green", "-"),
+            ("orange", "-"),
+            ("purple", "-"),
+        ],
+        ylabel="Latency",
+        plot_name="muon-symm-gemm-batch-performance",
+        args={},
+    )
+)
+def benchmark_batch(m: int, B: int, provider) -> None:
+    # NOTE (yiakwy) : batched symmetric gemm benchmark. All providers take the same
+    # contiguous (B, m, m) input; batch is the outter-most dim for the batched kernels.
+    torch.manual_seed(SEED)
+
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    x = torch.randn(B, m, m, dtype=torch.bfloat16, device="cuda")
+    xs_0 = torch.ones((B, m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
+    xs_1 = torch.ones(
+        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+    )
+
+    x_fp8 = x.to(torch.float8_e4m3fn)
+    wq_fp8 = x.to(torch.float8_e4m3fn)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    symm_gemm_op = GluonXXT()
+
+    if provider == "torch":
+        fn = lambda: x @ x.transpose(-1, -2)
+    elif provider == "triton_impl_ref":
+        fn = lambda: XXT(x)
+    elif provider == "gluon_muon_symm_gemm":
+        fn = lambda: symm_gemm_op(x)
+    elif provider == "cuda_muon_symm_gemm":
+        fn = lambda: symm_gemm_block_scaled(x_fp8, wq_fp8, xs_0, xs_1)
+
+    # warm up
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+
+    return ms * 1000, min_ms * 1000, max_ms * 1000
+
+
 if __name__ == "__main__":
     # Correctness check - simplified for CI
     if IS_CI:
         # Only test one configuration in CI
         test_configs = [configs[0]]
+        test_batch_configs = [BATCH_CONFIGS[0]]
     else:
         test_configs = configs
+        test_batch_configs = BATCH_CONFIGS
 
     for cfg in test_configs:
         print(f"cfg : {cfg}")
-        calculate_diff(*cfg)
+        # calculate_diff(*cfg)
+
+    for cfg in test_batch_configs:
+        print(f"batch cfg : {cfg}")
+        calculate_diff_batch(*cfg)
 
     print("\n" + "=" * 60)
     if not DEBUG:
         print("Starting performance benchmark...")
-        benchmark.run(print_data=True)
+        # benchmark.run(print_data=True)
+
+        print("\n" + "=" * 60)
+        print("Starting batch performance benchmark...")
+        benchmark_batch.run(print_data=True)

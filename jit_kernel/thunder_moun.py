@@ -175,16 +175,30 @@ def symm_gemm_block_scaled(
                 "xq is preferred to be in row major but found in column major in this algorithm"
             )
 
-        if xq.dim() > 2:
-            xq = xq.flatten(start_dim=1)
-
         assert algorithm in [
             "multi_stage",
             "wasp_1p2c",
         ], "algorithm must be either multi_stage or wasp_1p2c"
 
-    M, K = xq.shape
-    N = wq.shape[0]
+    is_batched = xq.dim() > 2
+
+    # NOTE (yiakwy) : batch symmetric gemm, mimicking the triton gluon XXT_kernel:
+    #   the 3D tensors are folded into 2D TMA descriptors on the device side
+    #   (batch offset = batch_idx * M, i.e. block_idx_m += batch_idx * num_blocks_m),
+    #   which requires a contiguous batched row-major layout (batch_stride == M * row_stride).
+    if is_batched:
+        assert (
+            xq.is_contiguous() and wq.is_contiguous()
+        ), "batched xq/wq must be contiguous (batch folding into 2D TMA descriptors requires batch_stride == M * row_stride)"
+
+        # TODO (yiakwy) : add group symmetric gemm support where we don't need xq, wq, xs and ws to be continous along batch dimension
+
+        B, M, K = xq.shape
+        N = wq.shape[1]
+    else:
+        B = 1
+        M, K = xq.shape
+        N = wq.shape[0]
 
     split_k = max(1, K // BLK_K)
 
@@ -192,32 +206,52 @@ def symm_gemm_block_scaled(
     split_k = 1
 
     if out is None:
-        out = torch.zeros((M, N), device=xq.device, dtype=torch.float16)
+        out = torch.empty(
+            (B, M, N) if is_batched else (M, N),
+            device=xq.device,
+            dtype=torch.float16,
+        )
+    else:
+        assert out.is_contiguous(), "out must be contiguous (single batch-expanded 2D output TMA descriptor)"
+
+    # TODO (yiakwy) : unified the interface
 
     if algorithm == "wasp_1p2c":
         module = _jit_thunder_moun_module_v2()
+
+        module.symmetric_gemm_fp8_block_scaled(
+            xq,
+            wq,
+            xs_lhs,
+            xs_rhs,
+            out,
+            M,
+            N,
+            K,
+            B,
+            xq.stride(-2), xq.stride(-1),
+            wq.stride(-2), wq.stride(-1),
+            out.stride(-2), out.stride(-1),
+            split_k,
+        )
     else:
+        # TODO (yiakwy) : multi_stage variant (symm_gemm.cu) does not support batched inputs yet
+        assert not is_batched, "multi_stage algorithm does not support batched inputs yet"
         module = _jit_thunder_moun_module()
 
-    # print(f"X ptr: {xq.data_ptr()}, Aligned 16B? {xq.data_ptr() % 16 == 0}")
-    # print(f"W ptr: {wq.data_ptr()}, Aligned 16B? {wq.data_ptr() % 16 == 0}")
-
-    module.symmetric_gemm_fp8_block_scaled(
-        xq,
-        wq,
-        xs_lhs,
-        xs_rhs,
-        out,
-        M,
-        N,
-        K,
-        xq.stride(0),
-        xq.stride(1),
-        wq.stride(0),
-        wq.stride(1),
-        out.stride(0),
-        out.stride(1),
-        split_k,
-    )
+        module.symmetric_gemm_fp8_block_scaled(
+            xq,
+            wq,
+            xs_lhs,
+            xs_rhs,
+            out,
+            M,
+            N,
+            K,
+            xq.stride(-2), xq.stride(-1),
+            wq.stride(-2), wq.stride(-1),
+            out.stride(-2), out.stride(-1),
+            split_k,
+        )
 
     return out

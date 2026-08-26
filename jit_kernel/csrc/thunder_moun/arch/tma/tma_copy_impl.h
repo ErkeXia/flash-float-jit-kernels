@@ -74,5 +74,67 @@ __device__ __inline__ void tma2d_store(uint64_t tma_addr/*gmem dest*/, uint32_t 
     );
 }
 
+// === 3D TMA bulk tensor copy helpers for batched symmetric GEMM ===
+
+__device__ __inline__ void tma3d_multicast_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
+                                                      uint32_t s_w_mbar_addr, /*mbarrier*/
+                                                      const int32_t dim0_offset, const int32_t dim1_offset, const int32_t dim2_offset,
+                                                      uint16_t cluster_mask, uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+        " [%0], [%1, {%3, %4, %5}], [%2], %6, %7;\n"
+        :: "r"(smem_addr), "l"(tma_desc_addr), "r"(s_w_mbar_addr),
+        "r"(dim0_offset), "r"(dim1_offset), "r"(dim2_offset), "h"(cluster_mask), "l"(cache_hint)
+    );
+}
+
+__device__ __inline__ void tma3d_multicast_load_async(void* smem_ptr/*smem dest*/, void const * tma_desc_ptr/*gmem src*/,
+                                                      uint64_t* s_w_mbar_ptr, /*mbarrier*/
+                                                      const int32_t dim0_offset, const int32_t dim1_offset, const int32_t dim2_offset,
+                                                      uint16_t cluster_mask, uint64_t cache_hint) {
+
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    const uint64_t tma_desc_addr = reinterpret_cast<uint64_t>(tma_desc_ptr);
+    uint32_t s_w_mbar_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
+
+    tma3d_multicast_load_async(smem_addr, tma_desc_addr, s_w_mbar_addr, dim0_offset, dim1_offset, dim2_offset, cluster_mask, cache_hint);
+}
+
+__device__ __inline__ void tma3d_load_async(void* smem_ptr/*smem dest*/, void const * tma_desc_ptr/*gmem src*/,
+                                            uint64_t* s_w_mbar_ptr, /*mbarrier*/
+                                            const int32_t dim0_offset, const int32_t dim1_offset, const int32_t dim2_offset,
+                                            uint64_t cache_hint) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    const uint64_t tma_desc_addr = reinterpret_cast<uint64_t>(tma_desc_ptr);
+    uint32_t s_w_mbar_addr = __cvta_generic_to_shared(s_w_mbar_ptr);
+
+    tma3d_load_async(smem_addr, tma_desc_addr, s_w_mbar_addr, dim0_offset, dim1_offset, dim2_offset, cache_hint);
+}
+
+__device__ __inline__ void tma3d_load_async(uint32_t smem_addr/*smem dest*/, const uint64_t tma_desc_addr/*gmem src*/,
+                                            uint32_t s_w_mbar_addr, /*mbarrier*/
+                                            const int32_t dim0_offset, const int32_t dim1_offset, const int32_t dim2_offset,
+                                            uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%3, %4, %5}], [%2], %6;\n"
+        :
+        : "r"(smem_addr), "l"(tma_desc_addr), "r"(s_w_mbar_addr),
+        "r"(dim0_offset), "r"(dim1_offset), "r"(dim2_offset), "l"(cache_hint)
+    );
+}
+
+__device__ __inline__ void tma3d_store(uint64_t tma_addr/*gmem dest*/, uint32_t smem_epilogue_addr /*smem src*/,
+                                       const int32_t dim0_offset, const int32_t dim1_offset, const int32_t dim2_offset) {
+    asm volatile (
+        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+        " [%0, {%2, %3, %4}], [%1];"
+        :
+        : "l"(tma_addr), "r"(smem_epilogue_addr),
+        "r"(dim0_offset), "r"(dim1_offset), "r"(dim2_offset)
+        : "memory"
+    );
+}
+
 } // namespace arch
 } // namespace nvgpu

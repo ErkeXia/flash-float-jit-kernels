@@ -327,9 +327,8 @@ def pick_wgmma_layout(dtype, BLOCK_M, BLOCK_N, num_warps):
 #    - https://github.com/triton-lang/triton/blob/main/python/examples/gluon/03-matmul-multicta.py
 @gluon.jit
 def XXT_kernel(
-    A_desc,
-    AT_desc,
-    C_desc,
+    A_desc, AT_desc,
+    C_desc, CT_desc,
     M,
     K,
     # a_stride_b, a_stride_r, a_stride_c,
@@ -344,6 +343,7 @@ def XXT_kernel(
     num_warps: gl.constexpr,
     num_blocks_m: gl.constexpr,
     num_triangular_blocks: gl.constexpr,
+    batch_size: gl.constexpr,  # NOTE (yiakwy) : 1 for 2D inputs, B for (B, M, K) inputs
     _cache_plance_holder: gl.constexpr,  # NOTE (yiakwy) : dummy argument to avoid TVM-FFI compiled result
 ):
     _pid = gl.program_id(axis=0)
@@ -358,7 +358,6 @@ def XXT_kernel(
         dtype, [STAGES] + A_desc.block_type.shape, A_desc.layout
     )
 
-    # TODO (yiakwy) : support BLOCK_SIZE_M != BLOCK_SIZE_N
     gl.assume(
         BLOCK_SIZE_M == BLOCK_SIZE_N
     )  #  "only support symmetric blocking to reduce shared memory usage"
@@ -367,9 +366,29 @@ def XXT_kernel(
         dtype, BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps
     )
 
+    # NOTE (yiakwy) : on-chip transpose buffer for the mirrored upper-triangle tile.
+    ct_buf = gl.allocate_shared_memory(
+        dtype, [BLOCK_SIZE_M, BLOCK_SIZE_N], C_desc.layout
+    )
+
+    # NOTE (yiakwy) : on-chip transpose for the mirrored strict-upper tile:
+    #   feeding the permuted view directly to tma.async_copy_shared_to_global is silently
+    #   corrupted / deadlocks there;
+    #   Layout note: BlockedLayout([4, 16], [8, 4], [4, 2], [1, 0]) exactly covers the
+    #   128x128 tile with num_warps=8 (64 elems per thread); adjust with the block/warp
+    #   config if those ever change.
+    transpose_layout: gl.constexpr = gl.BlockedLayout(
+        [4, 16],  # size_per_thread
+        [8, 4],   # threads_per_warp
+        [4, 2],   # warps_per_cta
+        [1, 0]    # order
+    )
+
     acc_dtype = gl.float32
 
-    for pid in range(_pid, num_triangular_blocks, NUM_CUs):
+    num_tiles = batch_size * num_triangular_blocks
+
+    for pid in range(_pid, num_tiles, NUM_CUs):
         batch_idx = pid // num_triangular_blocks
         pid_local = pid % num_triangular_blocks
 
@@ -486,15 +505,25 @@ def XXT_kernel(
         c = gl.allocate_shared_memory(
             C_desc.dtype, C_desc.block_type.shape, C_desc.layout
         )
-        c.store(acc.to(C_desc.dtype))
+
+        if acc.dtype != C_desc.dtype:
+            typed_acc = acc.to(C_desc.dtype)
+        else:
+            typed_acc = acc
+        c.store(typed_acc)
         fence_async_shared()
 
-        # NOTE (yiakwy) : store & transpose store
-        off_n = n_idx
-        tma.async_copy_shared_to_global(C_desc, [off_m, off_n], c)
+        # NOTE (yiakwy) : store the lower-triangle tile via TMA
+        tma.async_copy_shared_to_global(C_desc, [off_m, n_idx], c)
 
-        ct = c.permute((1, 0))  # gl.transpose(c)
-        tma.async_copy_shared_to_global(C_desc, [off_n, off_m], ct)
+        # NOTE (yiakwy) : on-chip transpose for the mirrored strict-upper tile:
+        if pid_m > pid_n:
+            regs = c.permute((1, 0)).load(transpose_layout)
+            ct_buf.store(regs)
+            fence_async_shared()
+
+            # off_n carries the batch plane offset (row coordinate), m_idx does not
+            tma.async_copy_shared_to_global(C_desc, [off_n, m_idx], ct_buf)
         tma.store_wait(pendings=0)
 
 
@@ -541,18 +570,19 @@ class GluonXXT:
         else:
             cache_mode = 0
 
+        batch_size = A.size(0) if A.ndim == 3 else 1
+
         a_layout = gl.NVMMASharedLayout.get_default_for(self.a_shape, gl.bfloat16)
         c_layout = gl.NVMMASharedLayout.get_default_for(self.c_shape, gl.bfloat16)
 
-        A_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
-        C_desc = TensorDescriptor.from_tensor(out, self.c_shape, c_layout)
+        A_flatten = A.view(batch_size * M, K) if A.ndim == 3 else A
+        out_flatten = out.view(batch_size * out.shape[-2], out.shape[-1]) if out.ndim > 2 else out
 
-        AT_desc = TensorDescriptor.from_tensor(A, self.a_shape, a_layout)
+        A_desc = TensorDescriptor.from_tensor(A_flatten, self.a_shape, a_layout)
+        C_desc = TensorDescriptor.from_tensor(out_flatten, self.c_shape, c_layout)
 
-        batch_size = A.size(0) if A.ndim == 3 else 1
-
-        # input_batch_stride = A.stride(0) if A.ndim == 3 else 0
-        # output_batch_stride = C.stride(0) if C.ndim == 3 else 0
+        AT_desc = TensorDescriptor.from_tensor(A_flatten, self.a_shape, a_layout)
+        CT_desc = TensorDescriptor.from_tensor(out_flatten, self.c_shape, c_layout)
 
         M, K = A.shape[-2:]
 
@@ -564,9 +594,8 @@ class GluonXXT:
         grid = (grid_size,)
 
         XXT_kernel[grid](
-            A_desc,
-            AT_desc,
-            C_desc,
+            A_desc, AT_desc,
+            C_desc, CT_desc,
             M=M,
             K=K,
             BLOCK_SIZE_M=self.BLOCK_SIZE_M,
@@ -579,8 +608,13 @@ class GluonXXT:
             num_warps=self.NUM_WARPS,  # 8 for multi stages, 12 for 1 x producer wg, 2 x consumers wg
             num_blocks_m=num_blocks_m,
             num_triangular_blocks=num_triangular_blocks,
+            batch_size=batch_size,
             _cache_plance_holder=cache_mode,
         )
+
+        if False: # fill only lower triangle for test
+            lower = out.tril()
+            out.copy_(lower + lower.transpose(-1, -2).triu(1))
 
         return out
 

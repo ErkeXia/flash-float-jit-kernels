@@ -97,14 +97,14 @@ void hopper_symm_gemm_kernel_entry(
     const float* __restrict__ scale_X,
     const float* __restrict__ scale_W,
     half* __restrict__ Out,
-    const int M, const int N, const int K,
+    const int M, const int N, const int K, const int B,
     const int total_symmetric_tiles,
     const int num_blocks_m, const int num_blocks_n, const int cluster_size_m,
-    __grid_constant__ const CUtensorMap tma_desc_X,
-    __grid_constant__ const CUtensorMap tma_desc_W,
-    __grid_constant__ const CUtensorMap tma_desc_O,
-    __grid_constant__ const CUtensorMap tma_desc_O_swizzle,
-    __grid_constant__ const CUtensorMap tma_desc_O_trans)
+    const __grid_constant__ CUtensorMap tma_desc_X,
+    const __grid_constant__ CUtensorMap tma_desc_W,
+    const __grid_constant__ CUtensorMap tma_desc_O,
+    const __grid_constant__ CUtensorMap tma_desc_O_swizzle,
+    const __grid_constant__ CUtensorMap tma_desc_O_trans)
 {
     extern __shared__ __align__(128) uint8_t smem_buffer[];
 
@@ -115,7 +115,7 @@ void hopper_symm_gemm_kernel_entry(
             &tma_desc_O, &tma_desc_O_swizzle, &tma_desc_O_trans,
             scale_X,
             scale_W,
-            Out, M, N, K,
+            Out, M, N, K, B,
             total_symmetric_tiles,
             num_blocks_m,
             num_blocks_n,
@@ -128,7 +128,7 @@ void hopper_symm_gemm_kernel_entry(
             &tma_desc_O, &tma_desc_O_swizzle, &tma_desc_O_trans,
             scale_X,
             scale_W,
-            Out, M, N, K,
+            Out, M, N, K, B,
             total_symmetric_tiles,
             num_blocks_m,
             num_blocks_n,
@@ -140,7 +140,7 @@ void hopper_symm_gemm_kernel_entry(
 // TVM-FFI raw C interface for JIT kernel invocation
 extern "C" int symm_gemm_fp8_block_scaled(
     void* X_ptr, void* W_ptr, void* scale_X, void* scale_W, void* Out_ptr,
-    int M, int N, int K,
+    int M, int N, int K, int B,
     int x_stride_m, int x_stride_k,
     int w_stride_n, int w_stride_k,
     int o_stride_m, int o_stride_n,
@@ -186,58 +186,58 @@ extern "C" int symm_gemm_fp8_block_scaled(
     // see references (12.8) :
     //   - https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
     //   - https://zhuanlan.zhihu.com/p/1985678344352731952
-    uint64_t shape_x[2] = {static_cast<uint64_t>(K), static_cast<uint64_t>(M)};
+    uint64_t shape_x[2] = {static_cast<uint64_t>(K), static_cast<uint64_t>((uint64_t)B * M)};
     uint64_t stride_x[1] = {static_cast<uint64_t>(x_stride_m)};
     uint32_t box_x[2] = {K_BLOCK_K, K_BLOCK_M};
     uint32_t step_x[2] = {1, 1};
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
-{
     // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
-    CUresult res = cuTensorMapEncodeTiled(
-        &desc_X, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (fp8_t*)X_ptr,
-        shape_x, stride_x, box_x, step_x,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        nvgpu::arch::get_tma_swizzle_mode<K_BLOCK_K>(), // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    {
+        CUresult res = cuTensorMapEncodeTiled(
+            &desc_X, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (fp8_t*)X_ptr,
+            shape_x, stride_x, box_x, step_x,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            nvgpu::arch::get_tma_swizzle_mode<K_BLOCK_K>(), // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-    if (res != CUDA_SUCCESS) {
-        const char* errStr;
-        cuGetErrorString(res, &errStr);
-        std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check tensorDim, boxSize, and strides!" << std::endl;
-        return -1;
+        if (res != CUDA_SUCCESS) {
+            const char* errStr;
+            cuGetErrorString(res, &errStr);
+            std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check tensorDim, boxSize, and strides!" << std::endl;
+            return -1;
+        }
     }
-}
 #else
 
 #error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
 
 #endif
 
-    uint64_t shape_w[2] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N)};
+    uint64_t shape_w[2] = {static_cast<uint64_t>(K), static_cast<uint64_t>((uint64_t)B * N)};
     uint64_t stride_w[1] = {static_cast<uint64_t>(w_stride_n)};
     uint32_t box_w[2] = {K_BLOCK_K, K_BLOCK_N};
     uint32_t step_w[2] = {1, 1};
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
-{
-     // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
-    CUresult res = cuTensorMapEncodeTiled(
-        &desc_W, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (fp8_t*)W_ptr,
-        shape_w, stride_w, box_w, step_w,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        nvgpu::arch::get_tma_swizzle_mode<K_BLOCK_K>(),// CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE); // CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+    // CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+    {
+        CUresult res = cuTensorMapEncodeTiled(
+            &desc_W, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (fp8_t*)W_ptr,
+            shape_w, stride_w, box_w, step_w,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            nvgpu::arch::get_tma_swizzle_mode<K_BLOCK_K>(),// CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE); // CU_TENSOR_MAP_L2_PROMOTION_L2_256B
 
-    if (res != CUDA_SUCCESS) {
-        const char* errStr;
-        cuGetErrorString(res, &errStr);
-        std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check tensorDim, boxSize, and strides!" << std::endl;
-        return -1;
+        if (res != CUDA_SUCCESS) {
+            const char* errStr;
+            cuGetErrorString(res, &errStr);
+            std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check tensorDim, boxSize, and strides!" << std::endl;
+            return -1;
+        }
     }
-}
 #else
 
 #error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
@@ -245,7 +245,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
 #endif
 
     // === TMapOut ===
-    uint64_t shape_o[2] = {static_cast<uint64_t>(N), static_cast<uint64_t>(M)};
+    uint64_t shape_o[2] = {static_cast<uint64_t>(N), static_cast<uint64_t>((uint64_t)B * M)};
     uint64_t stride_o[1] = {static_cast<uint64_t>(o_stride_m) * sizeof(fp16_t)};
     uint32_t box_o[2] = {K_BLOCK_N, K_BLOCK_M};
     uint32_t step_o[2] = {1, 1};
@@ -266,13 +266,13 @@ extern "C" int symm_gemm_fp8_block_scaled(
             std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check desc_O's tensorDim, boxSize, and strides!" << std::endl;
             return -1;
         }
-    }
+    } // desc_O
 
-    // Optional TMA descriptor for TMA native transpose store w or w/o swizzle.
-    uint32_t box_o_swizzle[2] = {K_BLOCK_N_SWIZZLE, K_BLOCK_M};
     {
+        // Optional TMA descriptor for TMA native transpose store w or w/o swizzle.
+        uint32_t box_o_swizzle[2] = {K_BLOCK_N_SWIZZLE, K_BLOCK_M};
         CUresult res = cuTensorMapEncodeTiled(
-            &desc_O_trans, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, (fp16_t*)Out_ptr,
+            &desc_O_swizzle, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, (fp16_t*)Out_ptr,
             shape_o, stride_o, box_o_swizzle, step_o,
             CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -285,12 +285,13 @@ extern "C" int symm_gemm_fp8_block_scaled(
             std::cerr << "TMA Encode Failed! Error: " << errStr << " | Check desc_O_swizzle's tensorDim, boxSize, and strides!" << std::endl;
             return -1;
         }
-    }
+    } // desc_O_swizzle
 
-    // Optional TMA descriptor for transpose store
-    // TODO (yiakwy) : test and remove
-    desc_O_trans = desc_O;
-
+    {
+        // Optional TMA descriptor for transpose store
+        // TODO (yiakwy) : test and remove
+        desc_O_trans = desc_O;
+    } // desc_O_trans
 #else
 
 #error "Not supported. We heavily rely on Hopper's TMA Multicast via NoC communication for efficient Split-K reduction and better IO/L2 cache reuse."
@@ -314,14 +315,20 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     // static_assert( num_blocks_m == num_blocks_n , "Unexpected value. For the momnet we only support K_BLOCK_M == K_BLOCK_N" );
 
-    int total_symmetric_tiles = (num_blocks_m * num_blocks_n + num_blocks_m) / 2;
+    int tiles_per_batch = (num_blocks_m * num_blocks_n + num_blocks_m) / 2;
+
+    // NOTE (yiakwy) : batch symmetric gemm, mimicking the triton gluon XXT_kernel:
+    //   the batch is the outter-most scheduling dimension of the linear tile id,
+    //   i.e. total_tiles = B * tiles_per_batch
+    int total_symmetric_tiles = tiles_per_batch * B;
 
     int grid_mn = MIN(SMs, total_symmetric_tiles);
 
     if (grid_mn < SMs) {
 #if ENABLE_HOPPER
+        // NOTE (yiakwy) : on-chip NoC reduction off when split_k == 1.
         if (grid_mn >= 64) {
-            split_k = 2;
+            split_k = MIN(split_k, 2);
         } else if (grid_mn >= 32) {
             split_k = MIN(split_k, 4);
         } else {
@@ -334,6 +341,11 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     int cluster_size_m = MIN(4, CLUSTER_SIZE_M);
     if (grid_mn % cluster_size_m != 0) {
+        cluster_size_m = 1;
+    }
+
+    // NOTE (yiakwy) : on-chip NoC reduction does not support TMA broadcast for now
+    if (split_k > 1) {
         cluster_size_m = 1;
     }
 
@@ -361,7 +373,8 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     cudaError_t state = cudaLaunchKernelEx(&launch_config, kernel,
         (const fp8_t*)X_ptr, (const fp8_t*)W_ptr, (const fp32_t*)scale_X, (fp32_t*)scale_W, (fp16_t*)Out_ptr,
-        M, N, K, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m, desc_X, desc_W, desc_O, desc_O_swizzle, desc_O_trans
+        M, N, K, B, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m,
+        desc_X, desc_W, desc_O, desc_O_swizzle, desc_O_trans
     );
 
     if (state != cudaSuccess) {
@@ -386,7 +399,7 @@ using namespace tvm::ffi;
 
 void tvm_jit_symm_gemm_fp8_block_scaled_launch(
     TensorView X, TensorView W, TensorView scale_X, TensorView scale_W, TensorView Out,
-    int M, int N, int K,
+    int M, int N, int K, int B,
     int x_stride_m, int x_stride_k,
     int w_stride_n, int w_stride_k,
     int o_stride_m, int o_stride_n,
@@ -397,7 +410,7 @@ void tvm_jit_symm_gemm_fp8_block_scaled_launch(
 
     symm_gemm_fp8_block_scaled(
         X.data_ptr(), W.data_ptr(), scale_X.data_ptr(), scale_W.data_ptr(), Out.data_ptr(),
-        M, N, K,
+        M, N, K, B,
         x_stride_m, x_stride_k,
         w_stride_n, w_stride_k,
         o_stride_m, o_stride_n,
