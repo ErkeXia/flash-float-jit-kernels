@@ -319,7 +319,7 @@ def calculate_diff_batch(m, B):
 
     o_torch_ref = (x @ x.transpose(-1, -2)).cpu()
 
-    print("o_torch_ref : ", o_torch_ref)
+    # print("o_torch_ref : ", o_torch_ref)
 
     def rel_err(a, ref):
         return (a - ref).float().norm().item() / ref.float().norm().item()
@@ -328,7 +328,7 @@ def calculate_diff_batch(m, B):
 
     o_gluon_ref = symm_gemm_op(x).cpu()
 
-    print("o_gluon_ref : ", o_gluon_ref)
+    # print("o_gluon_ref : ", o_gluon_ref)
 
     e = rel_err(o_gluon_ref, o_torch_ref)
     print(f"gluon ref rel err (Frobenius) : {e:.4e}")

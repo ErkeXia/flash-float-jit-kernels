@@ -366,6 +366,24 @@ def XXT_kernel(
         dtype, BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps
     )
 
+    # NOTE (yiakwy) : on-chip transpose buffer for the mirrored upper-triangle tile.
+    ct_buf = gl.allocate_shared_memory(
+        dtype, [BLOCK_SIZE_M, BLOCK_SIZE_N], C_desc.layout
+    )
+
+    # NOTE (yiakwy) : on-chip transpose for the mirrored strict-upper tile:
+    #   feeding the permuted view directly to tma.async_copy_shared_to_global is silently
+    #   corrupted / deadlocks there;
+    #   Layout note: BlockedLayout([4, 16], [8, 4], [4, 2], [1, 0]) exactly covers the
+    #   128x128 tile with num_warps=8 (64 elems per thread); adjust with the block/warp
+    #   config if those ever change.
+    transpose_layout: gl.constexpr = gl.BlockedLayout(
+        [4, 16],  # size_per_thread
+        [8, 4],   # threads_per_warp
+        [4, 2],   # warps_per_cta
+        [1, 0]    # order
+    )
+
     acc_dtype = gl.float32
 
     num_tiles = batch_size * num_triangular_blocks
@@ -499,31 +517,13 @@ def XXT_kernel(
         tma.async_copy_shared_to_global(C_desc, [off_m, n_idx], c)
 
         # NOTE (yiakwy) : on-chip transpose for the mirrored strict-upper tile:
-        #   feeding the permuted view directly to tma.async_copy_shared_to_global is silently
-        #   corrupted / deadlocks there;
-        #   Layout note: BlockedLayout([4, 16], [8, 4], [4, 2], [1, 0]) exactly covers the
-        #   128x128 tile with num_warps=8 (64 elems per thread); adjust with the block/warp
-        #   config if those ever change.
         if pid_m > pid_n:
-            # see https://triton-lang.org/main/getting-started/tutorials/gluon/layouts.html
-            # NOTE (yiakwy) : 128x128 tile for transpose
-            transpose_layout: gl.constexpr = gl.BlockedLayout(
-                [4, 16], # size_per_thread
-                [8, 4],  # threads_per_warp
-                [4, 2],  # warps_per_cta
-                [1, 0]   # order
-            )
             regs = c.permute((1, 0)).load(transpose_layout)
-
-            ct = gl.allocate_shared_memory(
-                C_desc.dtype, C_desc.block_type.shape, C_desc.layout
-            )
-            ct.store(regs)
+            ct_buf.store(regs)
             fence_async_shared()
 
-            # VARIANT-A: store2 disabled
-            if False:
-                tma.async_copy_shared_to_global(C_desc, [off_n, m_idx], ct)
+            # off_n carries the batch plane offset (row coordinate), m_idx does not
+            tma.async_copy_shared_to_global(C_desc, [off_n, m_idx], ct_buf)
         tma.store_wait(pendings=0)
 
 
