@@ -561,6 +561,7 @@ def _gluon_xxt_tvm_ffi(out, grid, kernel_kwargs, key):
             kernel_kwargs["A_desc"],
             kernel_kwargs["AT_desc"],
             kernel_kwargs["C_desc"],
+            kernel_kwargs["CT_desc"],
             M=kernel_kwargs["M"],
             K=kernel_kwargs["K"],
             BLOCK_SIZE_M=kernel_kwargs["BLOCK_SIZE_M"],
@@ -573,6 +574,7 @@ def _gluon_xxt_tvm_ffi(out, grid, kernel_kwargs, key):
             num_warps=kernel_kwargs["num_warps"],
             num_blocks_m=kernel_kwargs["num_blocks_m"],
             num_triangular_blocks=kernel_kwargs["num_triangular_blocks"],
+            batch_size=kernel_kwargs["batch_size"],
             _cache_plance_holder=kernel_kwargs["_cache_plance_holder"],
         )
         torch.cuda.synchronize()
@@ -683,6 +685,7 @@ class GluonXXT:
             "A_desc": A_desc,
             "AT_desc": AT_desc,
             "C_desc": C_desc,
+            "CT_desc": CT_desc,
             "M": M,
             "K": K,
             "BLOCK_SIZE_M": self.BLOCK_SIZE_M,
@@ -695,6 +698,7 @@ class GluonXXT:
             "num_warps": self.NUM_WARPS,
             "num_blocks_m": num_blocks_m,
             "num_triangular_blocks": num_triangular_blocks,
+            "batch_size": batch_size,
             "_cache_plance_holder": cache_mode,
         }
 

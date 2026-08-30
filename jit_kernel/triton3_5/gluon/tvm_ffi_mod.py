@@ -79,6 +79,13 @@ def generate_tensordesc_kernel_fields(name, rank):
     return "".join(fields)
 
 
+def generate_tensordesc_kernel_param_ptrs(name, rank):
+    params = [f"&kargs.{name}"]
+    params.extend(f"&kargs.{name}_shape_{i}" for i in range(rank))
+    params.extend(f"&kargs.{name}_stride_{i}" for i in range(rank))
+    return params
+
+
 def generate_scalar_kernel_field(name, sig):
     return f"    {cpp_scalar_type(sig)} {name};\n"
 
@@ -197,6 +204,7 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
     cpp_params = []
     launch_args_def = []
     launch_args = []
+    kernel_param_ptrs = []
     first_tensor_param = None
 
     for name, param in signature.parameters.items():
@@ -212,6 +220,9 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
                 continue
             launch_args_def.append(generate_tensordesc_kernel_fields(name, meta["rank"]))
             launch_args.append(generate_tensordesc_assignment(meta))
+            kernel_param_ptrs.extend(
+                generate_tensordesc_kernel_param_ptrs(name, meta["rank"])
+            )
             if first_tensor_param is None:
                 first_tensor_param = tensor_param_name(name)
         else:
@@ -220,6 +231,7 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
                 continue
             launch_args_def.append(generate_scalar_kernel_field(name, sig))
             launch_args.append(generate_scalar_assignment(name, sig))
+            kernel_param_ptrs.append(f"&kargs.{name}")
 
     META = compiled_kernel.metadata
     global_scratch_size = getattr(META, "global_scratch_size", 0) or 0
@@ -239,14 +251,17 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 
     launch_args_def.append("    CUdeviceptr global_scratch;\n")
     launch_args.append("    kargs.global_scratch = 0;\n")
+    kernel_param_ptrs.append("&kargs.global_scratch")
     launch_args_def.append("    CUdeviceptr profile_scratch;\n")
     launch_args.append("    kargs.profile_scratch = 0;\n")
+    kernel_param_ptrs.append("&kargs.profile_scratch")
 
     cpp_params_str = ",\n    ".join(
         cpp_params + ["int32_t grid_x", "int32_t grid_y", "int32_t grid_z"]
     )
     launch_args_def_str = "".join(launch_args_def)
     launch_args_str = "".join(launch_args)
+    kernel_param_ptrs_str = ",\n        ".join(kernel_param_ptrs)
 
     num_warps = META.num_warps
     warp_size = META.target.warp_size
@@ -262,7 +277,6 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 #include <cuda_runtime.h>
 #include <cuda.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -398,28 +412,7 @@ void {kernel_name}_launcher(
     tvm::ffi::dim3 block({num_warps * warp_size}, 1, 1);
 
     void* params[] = {{
-        &kargs.A_desc,
-        &kargs.A_desc_shape_0,
-        &kargs.A_desc_shape_1,
-        &kargs.A_desc_stride_0,
-        &kargs.A_desc_stride_1,
-
-        &kargs.AT_desc,
-        &kargs.AT_desc_shape_0,
-        &kargs.AT_desc_shape_1,
-        &kargs.AT_desc_stride_0,
-        &kargs.AT_desc_stride_1,
-
-        &kargs.C_desc,
-        &kargs.C_desc_shape_0,
-        &kargs.C_desc_shape_1,
-        &kargs.C_desc_stride_0,
-        &kargs.C_desc_stride_1,
-
-        &kargs.M,
-        &kargs.K,
-        &kargs.global_scratch,
-        &kargs.profile_scratch,
+        {kernel_param_ptrs_str}
     }};
 
     CUresult result = cuLaunchKernel(
